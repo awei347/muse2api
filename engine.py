@@ -1674,11 +1674,13 @@ class MuseEngine:
     })(%s, %s)"""
     _HISTORY_DOM_JS = r"""(function(){
       var out=[], seen={};
-      function push(kind,src,w,h,tag,cls){
+      function push(kind,src,w,h,el,tag){
         if(!src||seen[src]||/avatar|emoji|icon|logo/i.test(src))return;
+        if(el&&el.closest('aside,nav,header,footer,[role="navigation"]'))return;
         if((w||0)<80||(h||0)<80)return;
         seen[src]=1;
-        out.push({kind:kind,src:src,w:w||0,h:h||0,tag:tag,cls:String(cls||'').slice(0,120)});
+        out.push({kind:kind,src:src,w:w||0,h:h||0,
+          tag:tag||el.tagName,cls:String((el&&el.className)||'').slice(0,120)});
       }
       function scan(root){
         if(!root||!root.querySelectorAll)return;
@@ -1689,17 +1691,21 @@ class MuseEngine:
           if(!src&&el.tagName==='CANVAS'){try{src=el.toDataURL('image/png');}catch(e){}}
           var w=el.naturalWidth||el.videoWidth||el.clientWidth||0;
           var h=el.naturalHeight||el.videoHeight||el.clientHeight||0;
-          push(kind,src,w,h,el.tagName,el.className);
+          push(kind,src,w,h,el);
         });
         root.querySelectorAll('[style*=background-image]').forEach(function(el){
           var m=(el.getAttribute('style')||'').match(/url\(["']?([^"')]+)["']?\)/);
-          if(m)push('image',m[1],el.clientWidth,el.clientHeight,'BG',el.className);
+          if(m)push('image',m[1],el.clientWidth,el.clientHeight,el,'BG');
         });
         Array.prototype.forEach.call(root.querySelectorAll('*'),function(x){
           if(x.shadowRoot)scan(x.shadowRoot);
         });
       }
-      scan(document);
+      // 只扫聊天窗口，不扫侧栏、头像和导航里的视频。
+      var roots=[].slice.call(document.querySelectorAll(
+        'main,[class*="chat-scroll"],[class*="hatch-chat-scroll"]'));
+      if(!roots.length)roots=[document];
+      roots.forEach(scan);
       return JSON.stringify(out.slice(-24));
     })()"""
 
@@ -1732,8 +1738,8 @@ class MuseEngine:
             pass
         return 0, "", False
 
-    def _cdp_media_sources(self) -> list[dict]:
-        """用 CDP DOM 域穿透 Shadow DOM，找出页面里的 img/video 源。"""
+    def _cdp_media_sources(self, quiet: bool = False) -> list[dict]:
+        """用 CDP DOM 域穿透 Shadow DOM，找出聊天窗口里的 img/video 源。"""
         page = self.page
         if not page:
             return []
@@ -1743,9 +1749,18 @@ class MuseEngine:
             root = ((doc.get("result") or {}).get("root") or {}).get("nodeId")
             if not root:
                 return []
-            found = page.send("DOM.querySelectorAll",
-                              {"nodeId": root, "selector": "img,video"}, timeout=30)
-            node_ids = (found.get("result") or {}).get("nodeIds") or []
+            containers = page.send("DOM.querySelectorAll", {
+                "nodeId": root,
+                "selector": 'main,[class*="chat-scroll"],[class*="hatch-chat-scroll"]',
+            }, timeout=30)
+            scopes = (containers.get("result") or {}).get("nodeIds") or []
+            if not scopes:
+                scopes = [root]
+            node_ids = []
+            for scope in scopes:
+                found = page.send("DOM.querySelectorAll",
+                                  {"nodeId": scope, "selector": "img,video"}, timeout=30)
+                node_ids.extend((found.get("result") or {}).get("nodeIds") or [])
         except Exception as exc:  # noqa: BLE001
             log.warning("CDP 媒体节点扫描失败: %s", type(exc).__name__)
             return []
@@ -1763,12 +1778,13 @@ class MuseEngine:
                         "w:this.naturalWidth||this.videoWidth||0,"
                         "h:this.naturalHeight||this.videoHeight||0,"
                         "tag:this.tagName,"
+                        "skip:!!this.closest('aside,nav,header,footer,[role=\"navigation\"]'),"
                         "cls:String(this.className||'').slice(0,120)});}"),
                     "returnByValue": True,
                 }, timeout=15)
                 raw = (((ev.get("result") or {}).get("result") or {}).get("value"))
                 info = json.loads(raw) if raw else {}
-                if not info.get("src"):
+                if not info.get("src") or info.get("skip"):
                     continue
                 out.append({"kind": "video" if info.get("tag") == "VIDEO" else "image",
                             "src": info["src"], "w": info.get("w", 0),
@@ -1776,54 +1792,28 @@ class MuseEngine:
                             "cls": info.get("cls", ""), "html": info.get("html", "")})
             except Exception:  # noqa: BLE001
                 continue
-        log.info("CDP 原始媒体节点 %s 个: %s", len(out),
-                 [{"tag": m.get("tag"), "w": m.get("w"), "h": m.get("h"),
-                   "cls": (m.get("cls") or "")[:60], "src": str(m.get("src") or "")[:70]}
-                  for m in out[:10]])
+        if not quiet:
+            log.info("CDP 原始媒体节点 %s 个: %s", len(out),
+                     [{"tag": m.get("tag"), "w": m.get("w"), "h": m.get("h"),
+                       "cls": (m.get("cls") or "")[:60], "src": str(m.get("src") or "")[:70]}
+                      for m in out[:10]])
         return out
 
-    def _scan_history_dom_media(self) -> list[dict]:
+    def _scan_history_dom_media(self, quiet: bool = False) -> list[dict]:
+        """只扫描当前页面聊天窗口内的媒体，不碰侧栏头像和其它标签页。"""
         page = self.page
         if not page:
             return []
         try:
             raw = page.js(self._HISTORY_DOM_JS)
             items = json.loads(raw) if raw else []
-        except Exception as exc:  # noqa: BLE001
-            log.warning("主聊 DOM 媒体扫描失败: %s", type(exc).__name__)
-            return []
-        items = [m for m in items if isinstance(m, dict)]
-        # 图片查看器可能开在同一个账号上下文的另一个标签页里。
-        try:
-            targets = self.browser.send("Target.getTargets", timeout=10)
-            infos = (targets.get("result") or {}).get("targetInfos") or []
-            context_id = getattr(self, "current_context_id", None)
-            for info in infos:
-                if info.get("type") != "page":
-                    continue
-                if "muse.ai" not in (info.get("url") or ""):
-                    continue
-                if context_id and info.get("browserContextId") not in (None, context_id):
-                    continue
-                target_id = info.get("targetId")
-                if not target_id:
-                    continue
-                cdp = CDP(f"ws://127.0.0.1:{self.cfg.cdp_port}/devtools/page/{target_id}",
-                          timeout=15)
-                try:
-                    other = cdp.js(self._HISTORY_DOM_JS)
-                    for media in (json.loads(other) if other else []):
-                        if isinstance(media, dict):
-                            items.append(media)
-                except Exception:  # noqa: BLE001
-                    pass
-                finally:
-                    cdp.close()
+            items = [m for m in items if isinstance(m, dict)]
         except Exception as exc:  # noqa: BLE001
             if not quiet:
-                log.warning("跨标签页媒体扫描失败: %s", type(exc).__name__)
+                log.warning("聊天窗口媒体扫描失败: %s", type(exc).__name__)
+            return []
         seen = {m.get("src") for m in items}
-        for media in self._cdp_media_sources():
+        for media in self._cdp_media_sources(quiet=quiet):
             src = media.get("src") or ""
             if not src or src in seen or re.search(r"avatar|emoji|icon|logo", src, re.I):
                 continue
@@ -1831,10 +1821,14 @@ class MuseEngine:
                 continue
             seen.add(src)
             items.append(media)
-        log.info("主聊 DOM 媒体扫描 %s 项: %s", len(items),
-                 [{"tag": m.get("tag"), "cls": (m.get("cls") or "")[:48],
-                   "src": str(m.get("src") or "")[:60]} for m in items[:6]])
+        if not quiet:
+            log.info("聊天窗口媒体扫描 %s 项: %s", len(items),
+                     [{"tag": m.get("tag"), "cls": (m.get("cls") or "")[:48],
+                       "src": str(m.get("src") or "")[:60]} for m in items[:6]])
         return items
+
+    def _has_history_media(self) -> bool:
+        return bool(self._scan_history_dom_media(quiet=True))
 
     def main_chat_history(self, limit: int = 20, with_media: bool = False) -> list[dict]:
         """读取主聊页面最近若干条消息；with_media 时把气泡里的 blob 媒体转成 data URL。"""
@@ -1857,15 +1851,6 @@ class MuseEngine:
                 if isinstance(med, dict) and med.get("src"):
                     known_srcs.add(med["src"])
         extra = []
-        for att in self.attachments():
-            tid = str(att.get("tid") or "")
-            is_video = bool(att.get("hasVideo")) or "video" in tid.lower()
-            src = (att.get("vSrc") if is_video else None) or att.get("iSrc") or att.get("src") or ""
-            if not src or src in known_srcs:
-                continue
-            known_srcs.add(src)
-            extra.append({"kind": "video" if is_video else "image", "src": src,
-                          "w": att.get("w", 0), "h": att.get("h", 0)})
         for med in self._scan_history_dom_media():
             if len(extra) >= 12:
                 break

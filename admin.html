@@ -2555,7 +2555,11 @@ function chatBubble(role, text){
 }
 
 function appendChatMedia(el, media){
+  const seen = new Set();
   (Array.isArray(media) ? media : []).forEach(m => {
+    const key = m ? (m.dataUrl || m.src || '') : '';
+    if (key && seen.has(key)) return;
+    if (key) seen.add(key);
     if (m && m.dataUrl) {
       const node = document.createElement(m.kind === 'video' ? 'video' : 'img');
       node.src = m.dataUrl;
@@ -2735,12 +2739,7 @@ async function sendChat(){
           box.scrollTop = box.scrollHeight;
         } else if (ev.type === 'done') {
           finished = true;
-          const last = (ev.messages || []).slice().reverse().find(m => m && m.role === 'assistant');
-          if (last && (last.media || []).length) {
-            pending.textContent = last.text || '';
-            appendChatMedia(pending, last.media);
-            box.scrollTop = box.scrollHeight;
-          }
+          if (Array.isArray(ev.messages) && ev.messages.length) renderChatHistory(ev.messages);
           $('chatStatus').textContent = '已回复 · 账号 ' + (ev.account.label || ev.account.id);
         } else if (ev.type === 'error') {
           throw new Error(ev.message || '生成失败');
