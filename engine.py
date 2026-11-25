@@ -1674,14 +1674,29 @@ class MuseEngine:
           if(root&&root.host){el=root.host;continue;}
           el=el.parentElement;
         }
+        // 媒体不在气泡节点内时，按屏幕位置归到最近的气泡。
+        try{
+          var r=node.getBoundingClientRect();
+          if(r.width<1||r.height<1)return -1;
+          var best=-1, bestDist=1e9;
+          for(var k=0;k<bubbles.length;k++){
+            if(!indexOf.has(bubbles[k]))continue;
+            var br=bubbles[k].getBoundingClientRect();
+            var d=(r.top>=br.top&&r.top<=br.bottom)?0:
+              Math.min(Math.abs(r.top-br.top),Math.abs(r.top-br.bottom));
+            if(d<bestDist){bestDist=d;best=indexOf.get(bubbles[k]);}
+          }
+          if(best>=0)return best;
+        }catch(e){}
         return -1;
       }
-      var seen={};
+      var seen={}, unmatched=0, mediaCount=0;
       function add(node,kind,src,w,h){
         if(!src||/avatar|emoji|icon|logo/i.test(src))return;
         if((w||0)<80&&(h||0)<80)return;
+        mediaCount++;
         var i=owner(node);
-        if(i<0)return;
+        if(i<0){unmatched++;return;}
         var key=i+'|'+src;
         if(seen[key])return;
         seen[key]=1;
@@ -1709,7 +1724,9 @@ class MuseEngine:
         });
       }
       roots.forEach(scan);
-      return JSON.stringify(msgs.slice(-limit));
+      return JSON.stringify({messages:msgs.slice(-limit),
+        stats:{bubbles:bubbles.length,messages:msgs.length,
+          media:mediaCount,unmatched:unmatched}});
     })(%s)"""
     _HISTORY_MEDIA_JS = r"""(function(items,maxBytes){
       return Promise.all(items.map(function(it){
@@ -1900,7 +1917,12 @@ class MuseEngine:
         items: list[dict] = []
         try:
             raw = page.js(self._HISTORY_MAPPED_JS % capped_limit)
-            items = json.loads(raw) if raw else []
+            data = json.loads(raw) if raw else None
+            if isinstance(data, dict):
+                items = data.get("messages") or []
+                log.info("主聊气泡媒体映射: %s", data.get("stats") or {})
+            else:
+                items = data or []
         except Exception as exc:  # noqa: BLE001
             log.warning("按气泡映射主聊媒体失败: %s", type(exc).__name__)
         items = [m for m in items
