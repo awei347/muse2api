@@ -876,6 +876,7 @@ const I18N_EN = {
   "主聊暂无历史，已打开新对话": "No main-chat history; a new conversation is open",
   "已加载最近消息": "Recent messages loaded",
   "Muse 正在回复…": "Muse is replying…",
+  "等待回复超时（10 分钟）": "Reply timed out after 10 minutes",
   "聊天只支持粘贴图片或视频": "Chat accepts pasted images or videos only",
   "一次最多粘贴 10 个素材": "Up to 10 attachments per message",
   "单个素材不能超过 40 MiB": "Each attachment is limited to 40 MiB",
@@ -2521,6 +2522,7 @@ let chatFiles = [];
 let chatAccountId = 'auto';
 const CHAT_FILE_MAX = 40 * 1024 * 1024;
 const CHAT_TOTAL_MAX = 100 * 1024 * 1024;
+const CHAT_REPLY_TIMEOUT_MS = 10 * 60 * 1000;
 
 function selectChatAccount(id){
   if (chatBusy) return;
@@ -2720,11 +2722,15 @@ async function sendChat(){
 
   let answer = '';
   let finished = false;
+  const controller = new AbortController();
+  let timedOut = false;
+  const replyTimer = setTimeout(() => { timedOut = true; controller.abort(); },
+    CHAT_REPLY_TIMEOUT_MS);
   try {
     const headers = {'Content-Type': 'application/json'};
     if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
     const r = await fetch('/admin/chat/send', {
-      method: 'POST', headers,
+      method: 'POST', headers, signal: controller.signal,
       body: JSON.stringify({account_id: chatAccountId, message,
         images: images.length ? images : undefined,
         videos: videos.length ? videos : undefined, limit: 20})
@@ -2765,11 +2771,13 @@ async function sendChat(){
     }
     if (!finished) $('chatStatus').textContent = '连接已结束，可点「重载」确认最新记录';
   } catch (e) {
+    const reason = timedOut ? '等待回复超时（10 分钟）' : e.message;
     if (attached.length) { chatFiles = attached.concat(chatFiles); renderChatAttachments(); }
     $('chatStatus').textContent = '';
-    pending.textContent = answer ? answer + '\n（回复中断：' + e.message + '）' : '发送失败：' + e.message;
-    toast('聊天失败：' + e.message, 'bad');
+    pending.textContent = answer ? answer + '\n（回复中断：' + reason + '）' : '发送失败：' + reason;
+    toast('聊天失败：' + reason, 'bad');
   } finally {
+    clearTimeout(replyTimer);
     chatBusy = false;
     $('chatInput').disabled = false;
     $('chatSend').disabled = false;

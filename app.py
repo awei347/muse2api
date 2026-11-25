@@ -2288,7 +2288,8 @@ async def admin_chat_open(req: AdminChatOpenReq, _=Depends(auth)):
 @app.post("/admin/chat/send")
 async def admin_chat_send(req: AdminChatSendReq, _=Depends(auth)):
     """在选定账号的主聊中继续对话，流式返回助手增量。"""
-    timeout = int(req.timeout or CFG.chat_timeout)
+    # 网页聊天固定按 10 分钟等待回复，避免长连接无限挂起。
+    timeout = int(req.timeout or 600)
     refs = _reference_list(req.images, [], "images", {"videos": req.videos})
     prepared = _prepare_reference_images(refs)
     message = req.message.strip() or ("请查看我刚上传的附件并回复。"
