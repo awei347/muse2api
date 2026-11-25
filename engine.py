@@ -918,7 +918,10 @@ class MuseEngine:
             if n:
                 break
             time.sleep(0.15)
-        self._dump_main_chat_dom(page)
+        try:
+            log.info("主聊页面 URL: %s", page.js("location.href"))
+        except Exception:  # noqa: BLE001
+            pass
         # 历史图片常比文字晚渲染，最多再等 8 秒。
         t_media = time.time() + 8.0
         while time.time() < t_media:
@@ -1655,16 +1658,16 @@ class MuseEngine:
             return r.blob();
           }).then(function(b){
             if(b.size>maxBytes){
-              resolve({i:it.i,kind:it.kind,src:it.src,tooLarge:true,size:b.size});
+              resolve({i:it.i,kind:it.kind,tooLarge:true,size:b.size});
               return;
             }
             var fr=new FileReader();
-            fr.onload=function(){resolve({i:it.i,kind:it.kind,src:it.src,dataUrl:fr.result,
+            fr.onload=function(){resolve({i:it.i,kind:it.kind,dataUrl:fr.result,
               w:it.w,h:it.h,size:b.size});};
-            fr.onerror=function(){resolve({i:it.i,kind:it.kind,src:it.src,error:'read'});};
+            fr.onerror=function(){resolve({i:it.i,kind:it.kind,error:'read'});};
             fr.readAsDataURL(b);
           }).catch(function(e){
-            resolve({i:it.i,kind:it.kind,src:it.src,error:String(e&&e.message||e)});
+            resolve({i:it.i,kind:it.kind,error:String(e&&e.message||e)});
           });
         });
       }));
@@ -1699,41 +1702,6 @@ class MuseEngine:
       scan(document);
       return JSON.stringify(out.slice(-24));
     })()"""
-    _HISTORY_BUBBLE_HTML_JS = r"""(function(limit){
-      var bs=[].slice.call(document.querySelectorAll(
-        'div[class*="hatch-chat-groupable-bubble"]'));
-      return JSON.stringify({
-        total: bs.length,
-        html: bs.slice(-limit).map(function(b){
-          return (b.outerHTML||'').slice(0,1400);
-        }),
-        media: document.querySelectorAll('img,video,canvas').length,
-        text: (document.body ? (document.body.innerText||'') : '').slice(0,600)
-      });
-    })(%s)"""
-
-    def _dump_main_chat_dom(self, page=None):
-        page = page or self.page
-        if not page:
-            log.info("主聊 DOM 诊断: 当前线程没有页面")
-            return
-        try:
-            href = page.js("location.href")
-        except Exception as exc:  # noqa: BLE001
-            href = "读取失败:%s" % type(exc).__name__
-        log.info("主聊页面 URL: %s", href)
-        try:
-            raw = page.js(self._HISTORY_BUBBLE_HTML_JS % 3)
-            info = json.loads(raw) if raw else {}
-        except Exception as exc:  # noqa: BLE001
-            log.info("主聊气泡 HTML 读取失败: %s", type(exc).__name__)
-            return
-        log.info("主聊 DOM 诊断: 气泡=%s 媒体元素=%s",
-                 info.get("total"), info.get("media"))
-        for index, html in enumerate(info.get("html") or []):
-            log.info("主聊气泡 HTML[%s]: %s", index, html)
-        log.info("主聊页面文本: %s",
-                 (info.get("text") or "").replace("\r", " ").replace("\n", " | "))
 
     def _agent_text(self) -> str:
         """最后一个助手气泡的文本（取不到就返回空串）。"""
@@ -1765,36 +1733,19 @@ class MuseEngine:
         return 0, "", False
 
     def _cdp_media_sources(self) -> list[dict]:
-        """用 CDP DOM 域穿透 Shadow DOM 与 iframe，找出页面里的 img/video 源。"""
+        """用 CDP DOM 域穿透 Shadow DOM，找出页面里的 img/video 源。"""
         page = self.page
         if not page:
             return []
         out: list[dict] = []
-        node_ids: list[int] = []
         try:
-            tree = page.send("Page.getFrameTree", timeout=15)
-            frames: list[str | None] = []
-
-            def walk(frame):
-                if not frame:
-                    return
-                frames.append(frame.get("frameId"))
-                for child in (frame.get("childFrames") or []):
-                    walk(child)
-            walk((tree.get("result") or {}).get("frameTree"))
-            if not frames:
-                frames = [None]
-            for frame_id in frames:
-                args = {"depth": -1, "pierce": True}
-                if frame_id:
-                    args["frameId"] = frame_id
-                doc = page.send("DOM.getDocument", args, timeout=30)
-                root = ((doc.get("result") or {}).get("root") or {}).get("nodeId")
-                if not root:
-                    continue
-                found = page.send("DOM.querySelectorAll",
-                                  {"nodeId": root, "selector": "img,video"}, timeout=30)
-                node_ids.extend((found.get("result") or {}).get("nodeIds") or [])
+            doc = page.send("DOM.getDocument", {"depth": -1, "pierce": True}, timeout=30)
+            root = ((doc.get("result") or {}).get("root") or {}).get("nodeId")
+            if not root:
+                return []
+            found = page.send("DOM.querySelectorAll",
+                              {"nodeId": root, "selector": "img,video"}, timeout=30)
+            node_ids = (found.get("result") or {}).get("nodeIds") or []
         except Exception as exc:  # noqa: BLE001
             log.warning("CDP 媒体节点扫描失败: %s", type(exc).__name__)
             return []
@@ -1807,28 +1758,14 @@ class MuseEngine:
                 ev = page.send("Runtime.callFunctionOn", {
                     "objectId": object_id,
                     "functionDeclaration": (
-                        "async function(){"
-                        "var src=this.currentSrc||this.src||'';"
-                        "var info={src:src,w:this.naturalWidth||this.videoWidth||0,"
-                        "h:this.naturalHeight||this.videoHeight||0,tag:this.tagName,"
-                        "html:this.outerHTML.slice(0,400),"
-                        "cls:String(this.className||'').slice(0,120)};"
-                        "if(!src) return JSON.stringify(info);"
-                        "try{"
-                        "var r=await fetch(src);"
-                        "if(!r.ok){info.error='HTTP '+r.status;return JSON.stringify(info);}"
-                        "var b=await r.blob();"
-                        "if(b.size>40*1024*1024){info.tooLarge=true;info.size=b.size;"
-                        "return JSON.stringify(info);}"
-                        "info.dataUrl=await new Promise(function(res){"
-                        "var fr=new FileReader();fr.onload=function(){res(fr.result);};"
-                        "fr.onerror=function(){res('');};fr.readAsDataURL(b);});"
-                        "if(!info.dataUrl)info.error='read';"
-                        "}catch(e){info.error=String(e&&e.message||e);}"
-                        "return JSON.stringify(info);}"),
+                        "function(){return JSON.stringify({"
+                        "src:this.currentSrc||this.src||'',"
+                        "w:this.naturalWidth||this.videoWidth||0,"
+                        "h:this.naturalHeight||this.videoHeight||0,"
+                        "tag:this.tagName,"
+                        "cls:String(this.className||'').slice(0,120)});}"),
                     "returnByValue": True,
-                    "awaitPromise": True,
-                }, timeout=30)
+                }, timeout=15)
                 raw = (((ev.get("result") or {}).get("result") or {}).get("value"))
                 info = json.loads(raw) if raw else {}
                 if not info.get("src"):
@@ -1836,20 +1773,16 @@ class MuseEngine:
                 out.append({"kind": "video" if info.get("tag") == "VIDEO" else "image",
                             "src": info["src"], "w": info.get("w", 0),
                             "h": info.get("h", 0), "tag": info.get("tag"),
-                            "cls": info.get("cls", ""), "html": info.get("html", ""),
-                            "dataUrl": info.get("dataUrl", ""),
-                            "error": info.get("error", ""),
-                            "tooLarge": bool(info.get("tooLarge"))})
+                            "cls": info.get("cls", ""), "html": info.get("html", "")})
             except Exception:  # noqa: BLE001
                 continue
         log.info("CDP 原始媒体节点 %s 个: %s", len(out),
                  [{"tag": m.get("tag"), "w": m.get("w"), "h": m.get("h"),
-                   "cls": (m.get("cls") or "")[:60], "src": str(m.get("src") or "")[:70],
-                   "html": (m.get("html") or "")[:160]}
+                   "cls": (m.get("cls") or "")[:60], "src": str(m.get("src") or "")[:70]}
                   for m in out[:10]])
         return out
 
-    def _scan_history_dom_media(self, quiet: bool = False) -> list[dict]:
+    def _scan_history_dom_media(self) -> list[dict]:
         page = self.page
         if not page:
             return []
@@ -1870,7 +1803,7 @@ class MuseEngine:
                     continue
                 if "muse.ai" not in (info.get("url") or ""):
                     continue
-                if context_id and info.get("browserContextId") != context_id:
+                if context_id and info.get("browserContextId") not in (None, context_id):
                     continue
                 target_id = info.get("targetId")
                 if not target_id:
@@ -1898,23 +1831,10 @@ class MuseEngine:
                 continue
             seen.add(src)
             items.append(media)
-        if not quiet:
-            log.info("主聊 DOM 媒体扫描 %s 项: %s", len(items),
-                     [{"tag": m.get("tag"), "cls": (m.get("cls") or "")[:48],
-                       "src": str(m.get("src") or "")[:60]} for m in items[:6]])
+        log.info("主聊 DOM 媒体扫描 %s 项: %s", len(items),
+                 [{"tag": m.get("tag"), "cls": (m.get("cls") or "")[:48],
+                   "src": str(m.get("src") or "")[:60]} for m in items[:6]])
         return items
-
-    def _has_history_media(self) -> bool:
-        page = self.page
-        if not page:
-            return False
-        try:
-            if int(page.js("document.querySelectorAll("
-                           "'img,video,canvas,[style*=background-image]').length") or 0):
-                return True
-        except Exception:  # noqa: BLE001
-            pass
-        return bool(self._scan_history_dom_media(quiet=True))
 
     def main_chat_history(self, limit: int = 20, with_media: bool = False) -> list[dict]:
         """读取主聊页面最近若干条消息；with_media 时把气泡里的 blob 媒体转成 data URL。"""
@@ -1954,10 +1874,7 @@ class MuseEngine:
                 continue
             known_srcs.add(src)
             extra.append({"kind": med.get("kind", "image"), "src": src,
-                          "w": med.get("w", 0), "h": med.get("h", 0),
-                          "dataUrl": med.get("dataUrl", ""),
-                          "error": med.get("error", ""),
-                          "tooLarge": bool(med.get("tooLarge"))})
+                          "w": med.get("w", 0), "h": med.get("h", 0)})
         if extra:
             target = next((i for i in range(len(items) - 1, -1, -1)
                            if items[i].get("role") == "assistant"), None)
@@ -1976,10 +1893,7 @@ class MuseEngine:
                     continue
                 wanted.append({"i": index, "kind": med.get("kind", "image"),
                                "src": med["src"], "w": med.get("w", 0),
-                               "h": med.get("h", 0),
-                               "dataUrl": med.get("dataUrl", ""),
-                               "error": med.get("error", ""),
-                               "tooLarge": bool(med.get("tooLarge"))})
+                               "h": med.get("h", 0)})
             if len(wanted) >= MAX_HISTORY_MEDIA_ITEMS:
                 break
         if not wanted:
@@ -1992,17 +1906,6 @@ class MuseEngine:
         except Exception as exc:  # noqa: BLE001
             log.warning("读取主聊历史媒体失败: %s", type(exc).__name__)
             loaded = []
-        # CDP 已在同一节点上下文里转好的 blob 直接采用，不再重复 fetch。
-        direct = {(w["i"], w["src"]): w["dataUrl"]
-                  for w in wanted if w.get("dataUrl")}
-        for entry in loaded:
-            if not isinstance(entry, dict) or entry.get("dataUrl"):
-                continue
-            key = (entry.get("i"), entry.get("src"))
-            if key in direct:
-                entry["dataUrl"] = direct[key]
-                entry.pop("error", None)
-                entry.pop("tooLarge", None)
         # 跨域 http(s) 图片在页面里 fetch 会被 CORS 拦住，改由服务端按账号代理取回。
         src_by_index = {w["i"]: w["src"] for w in wanted}
         for entry in loaded:
