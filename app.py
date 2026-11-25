@@ -626,6 +626,7 @@ def admin_chat_stream(account_id: str | None, message: str, timeout: int, limit:
                 references=references
             ):
                 q.put(("delta", chunk))
+            engine.wait_new_chat_attachment(timeout=3.0)
             path = _admin_chat_page_path()
             messages = engine.main_chat_history(limit, with_media=True)
             store.mark(leased["id"], True, "")

@@ -1703,9 +1703,34 @@ class MuseEngine:
             return []
         if not with_media:
             return items
-        wanted = []
-        for index, msg in enumerate(items):
+        # 回复里的媒体常在气泡外的 presentation 容器里，补用生成链路的选择器。
+        known_srcs = set()
+        for msg in items:
             for med in (msg.get("media") or []):
+                if isinstance(med, dict) and med.get("src"):
+                    known_srcs.add(med["src"])
+        extra = []
+        for att in self.attachments():
+            tid = str(att.get("tid") or "")
+            is_video = bool(att.get("hasVideo")) or "video" in tid.lower()
+            src = (att.get("vSrc") if is_video else None) or att.get("iSrc") or att.get("src") or ""
+            if not src or src in known_srcs:
+                continue
+            known_srcs.add(src)
+            extra.append({"kind": "video" if is_video else "image", "src": src,
+                          "w": att.get("w", 0), "h": att.get("h", 0)})
+        if extra:
+            target = next((i for i in range(len(items) - 1, -1, -1)
+                           if items[i].get("role") == "assistant"), None)
+            if target is None:
+                items.append({"role": "assistant", "text": "", "media": []})
+                target = len(items) - 1
+            items[target].setdefault("media", []).extend(extra)
+        wanted = []
+        # 从最新消息往前取，避免名额被更早的历史图片占满。
+        for index in range(len(items) - 1, -1, -1):
+            msg = items[index]
+            for med in reversed(msg.get("media") or []):
                 if len(wanted) >= MAX_HISTORY_MEDIA_ITEMS:
                     break
                 if not isinstance(med, dict) or not med.get("src"):
@@ -1725,6 +1750,11 @@ class MuseEngine:
         except Exception as exc:  # noqa: BLE001
             log.warning("读取主聊历史媒体失败: %s", type(exc).__name__)
             loaded = []
+        ok_count = sum(1 for e in loaded if isinstance(e, dict) and e.get("dataUrl"))
+        if ok_count != len(wanted):
+            log.warning("主聊历史媒体回显 %s/%s，失败项: %s", ok_count, len(wanted),
+                        [e.get("error") or ("tooLarge" if e.get("tooLarge") else "no-data")
+                         for e in loaded if isinstance(e, dict) and not e.get("dataUrl")])
         resolved: dict[int, list[dict]] = {}
         for entry in loaded:
             if not isinstance(entry, dict) or entry.get("i") is None:
@@ -1739,6 +1769,19 @@ class MuseEngine:
             if 0 <= index < len(items):
                 items[index]["media"] = media
         return items
+
+    def wait_new_chat_attachment(self, timeout: float = 3.0) -> bool:
+        """文本结束后图片/视频可能还在渲染，给新媒体一点上屏时间。"""
+        baseline = int(getattr(self._ensure_local(), "chat_att_baseline", 0))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if len(self.attachments()) > baseline:
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.25)
+        return False
 
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
@@ -1761,6 +1804,7 @@ class MuseEngine:
             if upload:
                 local = self._ensure_local()
                 local.upload_dirs = list(getattr(local, "upload_dirs", None) or []) + [upload["dir"]]
+        self._ensure_local().chat_att_baseline = len(self.attachments())
         base_agent, base_text, _ = self._poll_chat()
         self._send(prompt)
 
