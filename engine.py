@@ -45,7 +45,7 @@ MAX_REFERENCE_IMAGES = 10
 MAX_REFERENCE_IMAGE_BYTES = 40 * 1024 * 1024
 MAX_REFERENCE_TOTAL_BYTES = 100 * 1024 * 1024
 MAX_REFERENCE_VIDEO_SECONDS = 120
-MAX_HISTORY_MEDIA_ITEMS = 8
+MAX_HISTORY_MEDIA_ITEMS = 20
 MAX_HISTORY_MEDIA_BYTES = 40 * 1024 * 1024
 _MIB = 1024 * 1024
 
@@ -1650,6 +1650,67 @@ class MuseEngine:
         "out.push({role:role,text:t.slice(0,20000),media:media});}"
         "return JSON.stringify(out.slice(-limit));})(%s)"
     )
+    _HISTORY_MAPPED_JS = r"""(function(limit){
+      var bubbles=[].slice.call(document.querySelectorAll(
+        'div[class*="hatch-chat-groupable-bubble"]'));
+      function roleOf(b){
+        var c=b.className||'';
+        if(/chat-user-bubble/.test(c))return 'user';
+        if(/hatch-agent-bubble-bg/.test(c))return 'assistant';
+        return '';
+      }
+      var msgs=[], indexOf=new Map();
+      bubbles.forEach(function(b){
+        var role=roleOf(b);
+        if(!role)return;
+        indexOf.set(b,msgs.length);
+        msgs.push({role:role,text:((b.innerText||'').trim()).slice(0,20000),media:[]});
+      });
+      function owner(node){
+        var el=node;
+        while(el){
+          if(indexOf.has(el))return indexOf.get(el);
+          var root=el.getRootNode&&el.getRootNode();
+          if(root&&root.host){el=root.host;continue;}
+          el=el.parentElement;
+        }
+        return -1;
+      }
+      var seen={};
+      function add(node,kind,src,w,h){
+        if(!src||/avatar|emoji|icon|logo/i.test(src))return;
+        if((w||0)<80&&(h||0)<80)return;
+        var i=owner(node);
+        if(i<0)return;
+        var key=i+'|'+src;
+        if(seen[key])return;
+        seen[key]=1;
+        msgs[i].media.push({kind:kind,src:src,w:w||0,h:h||0});
+      }
+      var roots=[].slice.call(document.querySelectorAll(
+        'main,[class*="chat-scroll"],[class*="hatch-chat-scroll"]'));
+      if(!roots.length)roots=[document];
+      function scan(root){
+        if(!root||!root.querySelectorAll)return;
+        root.querySelectorAll('img,video,canvas').forEach(function(el){
+          var kind=el.tagName==='VIDEO'?'video':'image';
+          var src=el.currentSrc||el.src||'';
+          if(!src&&el.tagName==='IMG'&&el.srcset)src=el.srcset.split(',')[0].trim().split(' ')[0];
+          if(!src&&el.tagName==='CANVAS'){try{src=el.toDataURL('image/png');}catch(e){}}
+          add(el,kind,src,el.naturalWidth||el.videoWidth||el.clientWidth,
+              el.naturalHeight||el.videoHeight||el.clientHeight);
+        });
+        root.querySelectorAll('[style*=background-image]').forEach(function(el){
+          var m=(el.getAttribute('style')||'').match(/url\(["']?([^"')]+)["']?\)/);
+          if(m)add(el,'image',m[1],el.clientWidth,el.clientHeight);
+        });
+        Array.prototype.forEach.call(root.querySelectorAll('*'),function(x){
+          if(x.shadowRoot)scan(x.shadowRoot);
+        });
+      }
+      roots.forEach(scan);
+      return JSON.stringify(msgs.slice(-limit));
+    })(%s)"""
     _HISTORY_MEDIA_JS = r"""(function(items,maxBytes){
       return Promise.all(items.map(function(it){
         return new Promise(function(resolve){
@@ -1658,16 +1719,16 @@ class MuseEngine:
             return r.blob();
           }).then(function(b){
             if(b.size>maxBytes){
-              resolve({i:it.i,kind:it.kind,tooLarge:true,size:b.size});
+              resolve({i:it.i,kind:it.kind,src:it.src,tooLarge:true,size:b.size});
               return;
             }
             var fr=new FileReader();
-            fr.onload=function(){resolve({i:it.i,kind:it.kind,dataUrl:fr.result,
+            fr.onload=function(){resolve({i:it.i,kind:it.kind,src:it.src,dataUrl:fr.result,
               w:it.w,h:it.h,size:b.size});};
-            fr.onerror=function(){resolve({i:it.i,kind:it.kind,error:'read'});};
+            fr.onerror=function(){resolve({i:it.i,kind:it.kind,src:it.src,error:'read'});};
             fr.readAsDataURL(b);
           }).catch(function(e){
-            resolve({i:it.i,kind:it.kind,error:String(e&&e.message||e)});
+            resolve({i:it.i,kind:it.kind,src:it.src,error:String(e&&e.message||e)});
           });
         });
       }));
@@ -1835,38 +1896,25 @@ class MuseEngine:
         page = self.page
         if not page:
             return []
+        capped_limit = max(1, min(int(limit), 100))
+        items: list[dict] = []
         try:
-            raw = page.js(self._MAIN_HISTORY_JS % max(1, min(int(limit), 100)))
+            raw = page.js(self._HISTORY_MAPPED_JS % capped_limit)
             items = json.loads(raw) if raw else []
+        except Exception as exc:  # noqa: BLE001
+            log.warning("按气泡映射主聊媒体失败: %s", type(exc).__name__)
+        items = [m for m in items
+                 if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+        if not items:
+            try:
+                raw = page.js(self._MAIN_HISTORY_JS % capped_limit)
+                items = json.loads(raw) if raw else []
+            except Exception:  # noqa: BLE001
+                return []
             items = [m for m in items
                      if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
-        except Exception:  # noqa: BLE001
-            return []
         if not with_media:
             return items
-        # 回复里的媒体常在气泡外的 presentation 容器里，补用生成链路的选择器。
-        known_srcs = set()
-        for msg in items:
-            for med in (msg.get("media") or []):
-                if isinstance(med, dict) and med.get("src"):
-                    known_srcs.add(med["src"])
-        extra = []
-        for med in self._scan_history_dom_media():
-            if len(extra) >= 12:
-                break
-            src = med.get("src")
-            if not src or src in known_srcs:
-                continue
-            known_srcs.add(src)
-            extra.append({"kind": med.get("kind", "image"), "src": src,
-                          "w": med.get("w", 0), "h": med.get("h", 0)})
-        if extra:
-            target = next((i for i in range(len(items) - 1, -1, -1)
-                           if items[i].get("role") == "assistant"), None)
-            if target is None:
-                items.append({"role": "assistant", "text": "", "media": []})
-                target = len(items) - 1
-            items[target].setdefault("media", []).extend(extra)
         wanted = []
         # 从最新消息往前取，避免名额被更早的历史图片占满。
         for index in range(len(items) - 1, -1, -1):
@@ -1892,11 +1940,11 @@ class MuseEngine:
             log.warning("读取主聊历史媒体失败: %s", type(exc).__name__)
             loaded = []
         # 跨域 http(s) 图片在页面里 fetch 会被 CORS 拦住，改由服务端按账号代理取回。
-        src_by_index = {w["i"]: w["src"] for w in wanted}
+        src_by_key = {(w["i"], w["src"]): w["src"] for w in wanted}
         for entry in loaded:
             if not isinstance(entry, dict) or entry.get("dataUrl"):
                 continue
-            src = src_by_index.get(entry.get("i"), "")
+            src = src_by_key.get((entry.get("i"), entry.get("src")), "")
             if not src.startswith(("http://", "https://")):
                 continue
             try:
@@ -1917,7 +1965,7 @@ class MuseEngine:
             log.warning("主聊历史媒体回显 %s/%s，失败项: %s", ok_count, len(wanted),
                         [e.get("error") or ("tooLarge" if e.get("tooLarge") else "no-data")
                          for e in loaded if isinstance(e, dict) and not e.get("dataUrl")])
-        resolved: dict[int, list[dict]] = {}
+        resolved: dict[tuple[int, str], dict] = {}
         for entry in loaded:
             if not isinstance(entry, dict) or entry.get("i") is None:
                 continue
@@ -1925,11 +1973,14 @@ class MuseEngine:
                 index = int(entry["i"])
             except (TypeError, ValueError):
                 continue
-            resolved.setdefault(index, []).append(
-                {k: v for k, v in entry.items() if k != "i"})
-        for index, media in resolved.items():
-            if 0 <= index < len(items):
-                items[index]["media"] = media
+            resolved[(index, str(entry.get("src") or ""))] = {
+                k: v for k, v in entry.items() if k != "i"}
+        for index, msg in enumerate(items):
+            merged = []
+            for med in (msg.get("media") or []):
+                key = (index, str(med.get("src") or ""))
+                merged.append(resolved.get(key, med))
+            msg["media"] = merged
         return items
 
     def wait_new_chat_attachment(self, timeout: float = 3.0) -> bool:
