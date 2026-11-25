@@ -2045,7 +2045,8 @@ class MuseEngine:
 
         t_sent = time.time()
         deadline = t_sent + timeout
-        first_token_deadline = min(deadline, t_sent + 40.0)
+        # 主聊页面走管理页，用户明确要求首字也等到完整超时；普通 API 仍保持 40 秒快速失败。
+        first_token_deadline = min(deadline, t_sent + (timeout if main_chat else 40.0))
         sent, last, stable = "", None, 0
         got_first = False
 
@@ -2056,7 +2057,7 @@ class MuseEngine:
             time.sleep(0.06)
             cnt, cur, has_stop = self._poll_chat()
             if not cur or (cnt <= base_agent and cur == base_text):
-                if time.time() - t_sent > 14.0:
+                if not main_chat and time.time() - t_sent > 14.0:
                     try:
                         tail = self.page.js("document.body.innerText.slice(-500)") or ""
                     except Exception:
@@ -2349,6 +2350,16 @@ class MuseEngine:
         }
     """
 
+    _ATTACHED_INPUT_COUNT_JS = "(function(){" + _COMPOSER_ROOTS_JS + """
+        var inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+        var roots = __composerRoots();
+        for (var r of roots) {
+            for (var x of inputs) {
+                if (r.contains(x) && x.files && x.files.length) return x.files.length;
+            }
+        }
+        return 0;
+    })()"""
     _FILE_INPUT_JS = "(function(){" + _COMPOSER_ROOTS_JS + """
         var inputs = Array.from(document.querySelectorAll('input[type="file"]'));
         var roots = __composerRoots();
@@ -2438,12 +2449,13 @@ class MuseEngine:
             attached_count = 0
             while time.monotonic() < deadline:
                 attached_count = self.page.js(self._ATTACHED_COUNT_JS)
-                if int(attached_count or 0) >= len(files):
+                input_count = self.page.js(self._ATTACHED_INPUT_COUNT_JS)
+                if max(int(attached_count or 0), int(input_count or 0)) >= len(files):
                     break
                 time.sleep(0.3)
             else:
                 raise MuseGenerationError(
-                    f"参考素材上传未确认（{int(attached_count or 0)}/{len(files)}），已停止生成")
+                    f"参考素材上传未确认（{max(int(attached_count or 0), int(input_count or 0))}/{len(files)}），已停止生成")
             time.sleep(0.5)
             return {"dir": upload_dir, "hashes": hashes}
         except Exception:
