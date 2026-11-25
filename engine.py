@@ -1655,16 +1655,16 @@ class MuseEngine:
             return r.blob();
           }).then(function(b){
             if(b.size>maxBytes){
-              resolve({i:it.i,kind:it.kind,tooLarge:true,size:b.size});
+              resolve({i:it.i,kind:it.kind,src:it.src,tooLarge:true,size:b.size});
               return;
             }
             var fr=new FileReader();
-            fr.onload=function(){resolve({i:it.i,kind:it.kind,dataUrl:fr.result,
+            fr.onload=function(){resolve({i:it.i,kind:it.kind,src:it.src,dataUrl:fr.result,
               w:it.w,h:it.h,size:b.size});};
-            fr.onerror=function(){resolve({i:it.i,kind:it.kind,error:'read'});};
+            fr.onerror=function(){resolve({i:it.i,kind:it.kind,src:it.src,error:'read'});};
             fr.readAsDataURL(b);
           }).catch(function(e){
-            resolve({i:it.i,kind:it.kind,error:String(e&&e.message||e)});
+            resolve({i:it.i,kind:it.kind,src:it.src,error:String(e&&e.message||e)});
           });
         });
       }));
@@ -1807,15 +1807,28 @@ class MuseEngine:
                 ev = page.send("Runtime.callFunctionOn", {
                     "objectId": object_id,
                     "functionDeclaration": (
-                        "function(){return JSON.stringify({"
-                        "src:this.currentSrc||this.src||'',"
-                        "w:this.naturalWidth||this.videoWidth||0,"
-                        "h:this.naturalHeight||this.videoHeight||0,"
-                        "tag:this.tagName,"
+                        "async function(){"
+                        "var src=this.currentSrc||this.src||'';"
+                        "var info={src:src,w:this.naturalWidth||this.videoWidth||0,"
+                        "h:this.naturalHeight||this.videoHeight||0,tag:this.tagName,"
                         "html:this.outerHTML.slice(0,400),"
-                        "cls:String(this.className||'').slice(0,120)});}"),
+                        "cls:String(this.className||'').slice(0,120)};"
+                        "if(!src) return JSON.stringify(info);"
+                        "try{"
+                        "var r=await fetch(src);"
+                        "if(!r.ok){info.error='HTTP '+r.status;return JSON.stringify(info);}"
+                        "var b=await r.blob();"
+                        "if(b.size>40*1024*1024){info.tooLarge=true;info.size=b.size;"
+                        "return JSON.stringify(info);}"
+                        "info.dataUrl=await new Promise(function(res){"
+                        "var fr=new FileReader();fr.onload=function(){res(fr.result);};"
+                        "fr.onerror=function(){res('');};fr.readAsDataURL(b);});"
+                        "if(!info.dataUrl)info.error='read';"
+                        "}catch(e){info.error=String(e&&e.message||e);}"
+                        "return JSON.stringify(info);}"),
                     "returnByValue": True,
-                }, timeout=15)
+                    "awaitPromise": True,
+                }, timeout=30)
                 raw = (((ev.get("result") or {}).get("result") or {}).get("value"))
                 info = json.loads(raw) if raw else {}
                 if not info.get("src"):
@@ -1823,7 +1836,10 @@ class MuseEngine:
                 out.append({"kind": "video" if info.get("tag") == "VIDEO" else "image",
                             "src": info["src"], "w": info.get("w", 0),
                             "h": info.get("h", 0), "tag": info.get("tag"),
-                            "cls": info.get("cls", ""), "html": info.get("html", "")})
+                            "cls": info.get("cls", ""), "html": info.get("html", ""),
+                            "dataUrl": info.get("dataUrl", ""),
+                            "error": info.get("error", ""),
+                            "tooLarge": bool(info.get("tooLarge"))})
             except Exception:  # noqa: BLE001
                 continue
         log.info("CDP 原始媒体节点 %s 个: %s", len(out),
@@ -1938,7 +1954,10 @@ class MuseEngine:
                 continue
             known_srcs.add(src)
             extra.append({"kind": med.get("kind", "image"), "src": src,
-                          "w": med.get("w", 0), "h": med.get("h", 0)})
+                          "w": med.get("w", 0), "h": med.get("h", 0),
+                          "dataUrl": med.get("dataUrl", ""),
+                          "error": med.get("error", ""),
+                          "tooLarge": bool(med.get("tooLarge"))})
         if extra:
             target = next((i for i in range(len(items) - 1, -1, -1)
                            if items[i].get("role") == "assistant"), None)
@@ -1957,7 +1976,10 @@ class MuseEngine:
                     continue
                 wanted.append({"i": index, "kind": med.get("kind", "image"),
                                "src": med["src"], "w": med.get("w", 0),
-                               "h": med.get("h", 0)})
+                               "h": med.get("h", 0),
+                               "dataUrl": med.get("dataUrl", ""),
+                               "error": med.get("error", ""),
+                               "tooLarge": bool(med.get("tooLarge"))})
             if len(wanted) >= MAX_HISTORY_MEDIA_ITEMS:
                 break
         if not wanted:
@@ -1970,6 +1992,17 @@ class MuseEngine:
         except Exception as exc:  # noqa: BLE001
             log.warning("读取主聊历史媒体失败: %s", type(exc).__name__)
             loaded = []
+        # CDP 已在同一节点上下文里转好的 blob 直接采用，不再重复 fetch。
+        direct = {(w["i"], w["src"]): w["dataUrl"]
+                  for w in wanted if w.get("dataUrl")}
+        for entry in loaded:
+            if not isinstance(entry, dict) or entry.get("dataUrl"):
+                continue
+            key = (entry.get("i"), entry.get("src"))
+            if key in direct:
+                entry["dataUrl"] = direct[key]
+                entry.pop("error", None)
+                entry.pop("tooLarge", None)
         # 跨域 http(s) 图片在页面里 fetch 会被 CORS 拦住，改由服务端按账号代理取回。
         src_by_index = {w["i"]: w["src"] for w in wanted}
         for entry in loaded:
