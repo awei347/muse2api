@@ -918,6 +918,16 @@ class MuseEngine:
             if n:
                 break
             time.sleep(0.15)
+        self._dump_main_chat_dom(page)
+        # 历史图片常比文字晚渲染，最多再等 8 秒。
+        t_media = time.time() + 8.0
+        while time.time() < t_media:
+            try:
+                if self._has_history_media():
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(0.5)
         return page
 
     def close_current_page(self):
@@ -1689,6 +1699,41 @@ class MuseEngine:
       scan(document);
       return JSON.stringify(out.slice(-24));
     })()"""
+    _HISTORY_BUBBLE_HTML_JS = r"""(function(limit){
+      var bs=[].slice.call(document.querySelectorAll(
+        'div[class*="hatch-chat-groupable-bubble"]'));
+      return JSON.stringify({
+        total: bs.length,
+        html: bs.slice(-limit).map(function(b){
+          return (b.outerHTML||'').slice(0,1400);
+        }),
+        media: document.querySelectorAll('img,video,canvas').length,
+        text: (document.body ? (document.body.innerText||'') : '').slice(0,600)
+      });
+    })(%s)"""
+
+    def _dump_main_chat_dom(self, page=None):
+        page = page or self.page
+        if not page:
+            log.info("主聊 DOM 诊断: 当前线程没有页面")
+            return
+        try:
+            href = page.js("location.href")
+        except Exception as exc:  # noqa: BLE001
+            href = "读取失败:%s" % type(exc).__name__
+        log.info("主聊页面 URL: %s", href)
+        try:
+            raw = page.js(self._HISTORY_BUBBLE_HTML_JS % 3)
+            info = json.loads(raw) if raw else {}
+        except Exception as exc:  # noqa: BLE001
+            log.info("主聊气泡 HTML 读取失败: %s", type(exc).__name__)
+            return
+        log.info("主聊 DOM 诊断: 气泡=%s 媒体元素=%s",
+                 info.get("total"), info.get("media"))
+        for index, html in enumerate(info.get("html") or []):
+            log.info("主聊气泡 HTML[%s]: %s", index, html)
+        log.info("主聊页面文本: %s",
+                 (info.get("text") or "").replace("\r", " ").replace("\n", " | "))
 
     def _agent_text(self) -> str:
         """最后一个助手气泡的文本（取不到就返回空串）。"""
@@ -1767,6 +1812,7 @@ class MuseEngine:
                         "w:this.naturalWidth||this.videoWidth||0,"
                         "h:this.naturalHeight||this.videoHeight||0,"
                         "tag:this.tagName,"
+                        "html:this.outerHTML.slice(0,400),"
                         "cls:String(this.className||'').slice(0,120)});}"),
                     "returnByValue": True,
                 }, timeout=15)
@@ -1777,16 +1823,17 @@ class MuseEngine:
                 out.append({"kind": "video" if info.get("tag") == "VIDEO" else "image",
                             "src": info["src"], "w": info.get("w", 0),
                             "h": info.get("h", 0), "tag": info.get("tag"),
-                            "cls": info.get("cls", "")})
+                            "cls": info.get("cls", ""), "html": info.get("html", "")})
             except Exception:  # noqa: BLE001
                 continue
         log.info("CDP 原始媒体节点 %s 个: %s", len(out),
                  [{"tag": m.get("tag"), "w": m.get("w"), "h": m.get("h"),
-                   "cls": (m.get("cls") or "")[:60], "src": str(m.get("src") or "")[:70]}
+                   "cls": (m.get("cls") or "")[:60], "src": str(m.get("src") or "")[:70],
+                   "html": (m.get("html") or "")[:160]}
                   for m in out[:10]])
         return out
 
-    def _scan_history_dom_media(self) -> list[dict]:
+    def _scan_history_dom_media(self, quiet: bool = False) -> list[dict]:
         page = self.page
         if not page:
             return []
@@ -1797,6 +1844,35 @@ class MuseEngine:
             log.warning("主聊 DOM 媒体扫描失败: %s", type(exc).__name__)
             return []
         items = [m for m in items if isinstance(m, dict)]
+        # 图片查看器可能开在同一个账号上下文的另一个标签页里。
+        try:
+            targets = self.browser.send("Target.getTargets", timeout=10)
+            infos = (targets.get("result") or {}).get("targetInfos") or []
+            context_id = getattr(self, "current_context_id", None)
+            for info in infos:
+                if info.get("type") != "page":
+                    continue
+                if "muse.ai" not in (info.get("url") or ""):
+                    continue
+                if context_id and info.get("browserContextId") != context_id:
+                    continue
+                target_id = info.get("targetId")
+                if not target_id:
+                    continue
+                cdp = CDP(f"ws://127.0.0.1:{self.cfg.cdp_port}/devtools/page/{target_id}",
+                          timeout=15)
+                try:
+                    other = cdp.js(self._HISTORY_DOM_JS)
+                    for media in (json.loads(other) if other else []):
+                        if isinstance(media, dict):
+                            items.append(media)
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    cdp.close()
+        except Exception as exc:  # noqa: BLE001
+            if not quiet:
+                log.warning("跨标签页媒体扫描失败: %s", type(exc).__name__)
         seen = {m.get("src") for m in items}
         for media in self._cdp_media_sources():
             src = media.get("src") or ""
@@ -1806,10 +1882,23 @@ class MuseEngine:
                 continue
             seen.add(src)
             items.append(media)
-        log.info("主聊 DOM 媒体扫描 %s 项: %s", len(items),
-                 [{"tag": m.get("tag"), "cls": (m.get("cls") or "")[:48],
-                   "src": str(m.get("src") or "")[:60]} for m in items[:6]])
+        if not quiet:
+            log.info("主聊 DOM 媒体扫描 %s 项: %s", len(items),
+                     [{"tag": m.get("tag"), "cls": (m.get("cls") or "")[:48],
+                       "src": str(m.get("src") or "")[:60]} for m in items[:6]])
         return items
+
+    def _has_history_media(self) -> bool:
+        page = self.page
+        if not page:
+            return False
+        try:
+            if int(page.js("document.querySelectorAll("
+                           "'img,video,canvas,[style*=background-image]').length") or 0):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return bool(self._scan_history_dom_media(quiet=True))
 
     def main_chat_history(self, limit: int = 20, with_media: bool = False) -> list[dict]:
         """读取主聊页面最近若干条消息；with_media 时把气泡里的 blob 媒体转成 data URL。"""
