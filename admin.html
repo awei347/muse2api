@@ -215,6 +215,8 @@
   .chat-msg.user{align-self:flex-end;background:linear-gradient(135deg,var(--accent2),var(--accent));color:#fff;border-bottom-right-radius:4px}
   .chat-msg.assistant{align-self:flex-start;background:var(--panel);border:1px solid var(--line);border-bottom-left-radius:4px}
   .chat-msg.system{align-self:center;color:var(--muted);font-size:12px;background:transparent;border:0;padding:4px}
+  .chat-msg img,.chat-msg video{display:block;max-width:100%;max-height:280px;border-radius:8px;margin-top:8px;background:var(--bg2)}
+  .chat-msg .chat-media-note{display:block;margin-top:6px;color:var(--muted);font-size:11.5px}
   .chat-composer{display:flex;gap:10px;align-items:flex-end}
   .chat-composer textarea{flex:1;min-height:76px;max-height:220px}
   .chat-attachments{display:flex;flex-wrap:wrap;gap:8px}
@@ -814,7 +816,7 @@ t = requests.post(<span class="s">"BASE/v1/videos"</span>, json={<span class="s"
 </main>
 
 <footer style="max-width:1280px;margin:18px auto 32px;padding:12px 24px;text-align:center;color:var(--muted);font-size:12px;border-top:1px solid var(--line)">
-  <span>开源仓库：<a href="https://github.com/czg86389-hub/muse2api" target="_blank" style="color:var(--acc);text-decoration:none">GitHub · muse2api</a></span>
+  <span>开源仓库：<a href="https://github.com/czg86389-hub/muse2api" target="_blank" style="color:var(--accent);text-decoration:none">GitHub · muse2api</a></span>
 </footer>
 
 <div id="toasts"></div>
@@ -2525,6 +2527,7 @@ async function loadStatus(){
 /* ================= 网页聊天（主聊） ================= */
 let chatBusy = false;
 let chatFiles = [];
+let chatAccountId = 'auto';
 const CHAT_FILE_MAX = 40 * 1024 * 1024;
 const CHAT_TOTAL_MAX = 100 * 1024 * 1024;
 
@@ -2551,12 +2554,34 @@ function chatBubble(role, text){
   return d;
 }
 
+function appendChatMedia(el, media){
+  (Array.isArray(media) ? media : []).forEach(m => {
+    if (m && m.dataUrl) {
+      const node = document.createElement(m.kind === 'video' ? 'video' : 'img');
+      node.src = m.dataUrl;
+      if (m.kind === 'video') { node.controls = true; node.preload = 'metadata'; }
+      else node.alt = 'muse 图片';
+      el.appendChild(node);
+    } else {
+      const note = document.createElement('span');
+      note.className = 'chat-media-note';
+      note.textContent = (m && m.kind === 'video' ? '视频' : '图片')
+        + (m && m.tooLarge ? '（过大，未回显）' : '（未能回显）');
+      el.appendChild(note);
+    }
+  });
+}
+
 function renderChatHistory(messages){
   const box = $('chatMessages');
   box.innerHTML = '';
   const list = Array.isArray(messages) ? messages : [];
   if (!list.length) box.appendChild(chatBubble('system', '该账号主聊暂无最近消息，可以直接开始对话'));
-  list.forEach(m => box.appendChild(chatBubble(m.role === 'user' ? 'user' : 'assistant', m.text)));
+  list.forEach(m => {
+    const el = chatBubble(m.role === 'user' ? 'user' : 'assistant', m.text);
+    appendChatMedia(el, m.media);
+    box.appendChild(el);
+  });
   box.scrollTop = box.scrollHeight;
 }
 
@@ -2635,6 +2660,7 @@ async function openChat(){
       body: JSON.stringify({account_id: $('chatAccount').value, limit: 20})
     });
     renderChatHistory(d.messages);
+    chatAccountId = d.account.id;
     const emptyHistory = !d.path || d.path.indexOf('thread/new') >= 0;
     $('chatStatus').textContent = '已选择：' + (d.account.label || d.account.id)
       + (emptyHistory ? '（主聊暂无历史，已打开新对话）' : '（已加载最近消息）');
@@ -2678,7 +2704,7 @@ async function sendChat(){
     if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
     const r = await fetch('/admin/chat/send', {
       method: 'POST', headers,
-      body: JSON.stringify({account_id: $('chatAccount').value, message,
+      body: JSON.stringify({account_id: chatAccountId || $('chatAccount').value, message,
         images: images.length ? images : undefined,
         videos: videos.length ? videos : undefined, limit: 20})
     });
@@ -2709,6 +2735,12 @@ async function sendChat(){
           box.scrollTop = box.scrollHeight;
         } else if (ev.type === 'done') {
           finished = true;
+          const last = (ev.messages || []).slice().reverse().find(m => m && m.role === 'assistant');
+          if (last && (last.media || []).length) {
+            pending.textContent = last.text || '';
+            appendChatMedia(pending, last.media);
+            box.scrollTop = box.scrollHeight;
+          }
           $('chatStatus').textContent = '已回复 · 账号 ' + (ev.account.label || ev.account.id);
         } else if (ev.type === 'error') {
           throw new Error(ev.message || '生成失败');

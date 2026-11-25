@@ -45,6 +45,8 @@ MAX_REFERENCE_IMAGES = 10
 MAX_REFERENCE_IMAGE_BYTES = 40 * 1024 * 1024
 MAX_REFERENCE_TOTAL_BYTES = 100 * 1024 * 1024
 MAX_REFERENCE_VIDEO_SECONDS = 120
+MAX_HISTORY_MEDIA_ITEMS = 8
+MAX_HISTORY_MEDIA_BYTES = 12 * 1024 * 1024
 _MIB = 1024 * 1024
 
 # 允许上传到 muse 输入框的素材类型 -> 落盘扩展名。
@@ -723,25 +725,29 @@ class MuseEngine:
             out[name] = {"value": c.get("value", ""), "expires": exp}
         return out
 
-    def _wait_ws_ready(self, page: CDP, timeout: float = 15.0) -> bool:
-        """等待 muse.ai 页面完成 React hydration 且不再处于 Connecting... 状态。"""
+    def _wait_ws_ready(self, page: CDP, timeout: float = 15.0,
+                       relaxed: bool = False) -> bool:
+        """等待输入框就绪。relaxed 用于主聊页面，不强求 hydration / Connecting 状态。"""
         deadline = time.time() + timeout
+        expr = """(function(relaxed){
+            if (document.readyState !== 'complete') return 'loading';
+            var ta = document.querySelector('textarea');
+            if (!ta) return 'no-ta';
+            if (!relaxed) {
+                var h = document.querySelector('[data-hatch-shell-hydration-state]');
+                if (h && h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return 'hydrating';
+                var b = document.body ? (document.body.innerText || '') : '';
+                if (b.indexOf('Connecting...') !== -1) return 'connecting';
+            }
+            // Empty composers may not render Send until text has been entered.
+            if (ta.disabled) return 'input-disabled';
+            return 'ready';
+        })(%s)""" % ("true" if relaxed else "false")
         while time.time() < deadline:
             try:
-                st = page.js("""(function(){
-                    if (document.readyState !== 'complete') return 'loading';
-                    if (!document.querySelector('textarea')) return 'no-ta';
-                    var h = document.querySelector('[data-hatch-shell-hydration-state]');
-                    if (h && h.getAttribute('data-hatch-shell-hydration-state') !== 'hydrated') return 'hydrating';
-                    var b = document.body ? (document.body.innerText || '') : '';
-                    if (b.indexOf('Connecting...') !== -1) return 'connecting';
-                    // Empty composers may not render Send until text has been entered.
-                    if (document.querySelector('textarea').disabled) return 'input-disabled';
-                    return 'ready';
-                })()""")
-                if st == "ready":
+                if page.js(expr) == "ready":
                     return True
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
             time.sleep(0.1)
         return False
@@ -800,9 +806,12 @@ class MuseEngine:
         except Exception as e:  # noqa: BLE001
             log.warning("保存轮换后的 cookie 失败 %s: %s", account_id, e)
 
-    def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
+    def ensure_page(self, cookies: dict, expires: dict | None = None,
+                    account_id: str | None = None, target_url: str | None = None):
+        """打开 muse 页面；target_url 用于直接进入主聊首页而不是 /thread/new。"""
         resolver = getattr(self, "proxy_resolver", None)
         local = self._ensure_local()
+        target_path = ("/" if target_url else "/thread/new").rstrip("/")
         # A lease snapshots routing; a concurrent config edit must never change its exit.
         proxy = copy.deepcopy(local.proxy_snapshot if hasattr(local, "proxy_snapshot")
                               else resolver(account_id) if resolver and account_id else None)
@@ -810,9 +819,13 @@ class MuseEngine:
                 and getattr(self._ensure_local(), "proxy_config", None) == proxy
                 and (account_id is None or getattr(self, "current_acc_id", None) == account_id)):
             try:
-                if self.page.js("!!document.querySelector('textarea')") and self._wait_ws_ready(self.page, timeout=8.0):
+                path = str(self.page.js("location.pathname") or "").rstrip("/")
+                if (path == target_path
+                        and self.page.js("!!document.querySelector('textarea')")
+                        and self._wait_ws_ready(self.page, timeout=8.0,
+                                                relaxed=bool(target_url))):
                     return self.page
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
         self._close_page()
         # 仅当距离上次 HTTP 续签超过 10 分钟时才在主链路调用 /api/session，避免每次切号重复阻塞
@@ -850,8 +863,9 @@ class MuseEngine:
         self.page = page  # Cleanup must also own pages that never become ready.
         self._ensure_local().proxy_config = proxy
         self._apply_cookies(page, cookies, expires)
-        page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
-        if self._wait_ws_ready(page, timeout=self.cfg.login_wait):
+        page.send("Page.navigate", {"url": target_url or "https://muse.ai/thread/new"})
+        if self._wait_ws_ready(page, timeout=self.cfg.login_wait,
+                               relaxed=bool(target_url)):
             self.current_acc_id = account_id
             return page
         try:
@@ -872,7 +886,8 @@ class MuseEngine:
     def open_main_chat(self, cookies: dict, expires: dict | None = None,
                        account_id: str | None = None):
         """打开账号的主聊页面（muse.ai 首页），而不是隔离的 /thread/new。"""
-        page = self.ensure_page(cookies, expires, account_id=account_id)
+        page = self.ensure_page(cookies, expires, account_id=account_id,
+                                target_url=self.cfg.site_url)
         try:
             path = str(page.js("location.pathname") or "")
         except Exception:  # noqa: BLE001
@@ -891,7 +906,7 @@ class MuseEngine:
                     break
             else:
                 raise MuseGenerationError("muse.ai 主聊页面加载超时（未出现聊天输入框）")
-            self._wait_ws_ready(page, timeout=12.0)
+            self._wait_ws_ready(page, timeout=12.0, relaxed=True)
         # 主聊历史是异步渲染的，给最近几条消息一点时间上屏。
         t_hist = time.time() + 6.0
         while time.time() < t_hist:
@@ -1609,11 +1624,41 @@ class MuseEngine:
         "var role=/chat-user-bubble/.test(c)?'user':"
         "(/hatch-agent-bubble-bg/.test(c)?'assistant':null);"
         "if(!role)continue;"
+        "var media=[];"
+        "bs[i].querySelectorAll('img,video').forEach(function(m){"
+        "var s=m.currentSrc||m.src||'';"
+        "if(!s||/avatar|emoji/i.test(s))return;"
+        "if(media.some(function(x){return x.src===s;}))return;"
+        "media.push({kind:m.tagName==='VIDEO'?'video':'image',src:s,"
+        "w:(m.naturalWidth||m.videoWidth||0),h:(m.naturalHeight||m.videoHeight||0)});"
+        "});"
         "var t=(bs[i].innerText||'').trim();"
-        "if(!t)continue;"
-        "out.push({role:role,text:t.slice(0,20000)});}"
+        "if(!t&&!media.length)continue;"
+        "out.push({role:role,text:t.slice(0,20000),media:media});}"
         "return JSON.stringify(out.slice(-limit));})(%s)"
     )
+    _HISTORY_MEDIA_JS = r"""(function(items,maxBytes){
+      return Promise.all(items.map(function(it){
+        return new Promise(function(resolve){
+          fetch(it.src).then(function(r){
+            if(!r.ok) throw new Error('HTTP '+r.status);
+            return r.blob();
+          }).then(function(b){
+            if(b.size>maxBytes){
+              resolve({i:it.i,kind:it.kind,tooLarge:true,size:b.size});
+              return;
+            }
+            var fr=new FileReader();
+            fr.onload=function(){resolve({i:it.i,kind:it.kind,dataUrl:fr.result,
+              w:it.w,h:it.h,size:b.size});};
+            fr.onerror=function(){resolve({i:it.i,kind:it.kind,error:'read'});};
+            fr.readAsDataURL(b);
+          }).catch(function(e){
+            resolve({i:it.i,kind:it.kind,error:String(e&&e.message||e)});
+          });
+        });
+      }));
+    })(%s, %s)"""
 
     def _agent_text(self) -> str:
         """最后一个助手气泡的文本（取不到就返回空串）。"""
@@ -1644,18 +1689,56 @@ class MuseEngine:
             pass
         return 0, "", False
 
-    def main_chat_history(self, limit: int = 20) -> list[dict]:
-        """读取主聊页面最近若干条消息（role=user/assistant）。"""
+    def main_chat_history(self, limit: int = 20, with_media: bool = False) -> list[dict]:
+        """读取主聊页面最近若干条消息；with_media 时把气泡里的 blob 媒体转成 data URL。"""
         page = self.page
         if not page:
             return []
         try:
             raw = page.js(self._MAIN_HISTORY_JS % max(1, min(int(limit), 100)))
             items = json.loads(raw) if raw else []
-            return [m for m in items
-                    if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+            items = [m for m in items
+                     if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
         except Exception:  # noqa: BLE001
             return []
+        if not with_media:
+            return items
+        wanted = []
+        for index, msg in enumerate(items):
+            for med in (msg.get("media") or []):
+                if len(wanted) >= MAX_HISTORY_MEDIA_ITEMS:
+                    break
+                if not isinstance(med, dict) or not med.get("src"):
+                    continue
+                wanted.append({"i": index, "kind": med.get("kind", "image"),
+                               "src": med["src"], "w": med.get("w", 0),
+                               "h": med.get("h", 0)})
+            if len(wanted) >= MAX_HISTORY_MEDIA_ITEMS:
+                break
+        if not wanted:
+            return items
+        try:
+            raw = page.js(self._HISTORY_MEDIA_JS % (
+                json.dumps(wanted), MAX_HISTORY_MEDIA_BYTES),
+                await_promise=True, timeout=60)
+            loaded = raw if isinstance(raw, list) else (json.loads(raw) if raw else [])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("读取主聊历史媒体失败: %s", type(exc).__name__)
+            loaded = []
+        resolved: dict[int, list[dict]] = {}
+        for entry in loaded:
+            if not isinstance(entry, dict) or entry.get("i") is None:
+                continue
+            try:
+                index = int(entry["i"])
+            except (TypeError, ValueError):
+                continue
+            resolved.setdefault(index, []).append(
+                {k: v for k, v in entry.items() if k != "i"})
+        for index, media in resolved.items():
+            if 0 <= index < len(items):
+                items[index]["media"] = media
+        return items
 
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
