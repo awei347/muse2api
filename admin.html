@@ -205,6 +205,32 @@
   .keybox.miss .lbl{color:var(--warn)}
   .langsel{width:auto;flex:0 0 auto;background:var(--bg2);color:var(--text);border:1px solid var(--line2);border-radius:999px;padding:4px 10px;font-size:12px;cursor:pointer}
   .updpill-alert{border-color:rgba(251,191,36,.8)!important;background:rgba(251,191,36,.15)!important;color:var(--warn)!important;animation:pulse 1.6s infinite}
+
+  /* ---------- 网页聊天（主聊） ---------- */
+  .chat-shell{display:flex;flex-direction:column;gap:12px;padding-bottom:64px}
+  .chat-log{height:min(58vh,620px);min-height:320px;overflow-y:auto;border:1px solid var(--line);border-radius:var(--radius);
+    background:var(--bg2);padding:16px;display:flex;flex-direction:column;gap:12px}
+  .chat-msg{max-width:min(78%,760px);padding:10px 13px;border-radius:13px;white-space:pre-wrap;word-break:break-word;
+    font-size:13.5px;line-height:1.65}
+  .chat-msg.user{align-self:flex-end;background:linear-gradient(135deg,var(--accent2),var(--accent));color:#fff;border-bottom-right-radius:4px}
+  .chat-msg.assistant{align-self:flex-start;background:var(--panel);border:1px solid var(--line);border-bottom-left-radius:4px}
+  .chat-msg.system{align-self:center;color:var(--muted);font-size:12px;background:transparent;border:0;padding:4px}
+  .chat-composer{display:flex;gap:10px;align-items:flex-end}
+  .chat-composer textarea{flex:1;min-height:76px;max-height:220px}
+  .chat-attachments{display:flex;flex-wrap:wrap;gap:8px}
+  .chat-attachments:empty{display:none}
+  .chat-file{display:flex;align-items:center;gap:8px;max-width:240px;padding:6px 8px;background:var(--panel);
+    border:1px solid var(--line);border-radius:10px;font-size:12px}
+  .chat-file img,.chat-file .vicon{width:42px;height:42px;flex:0 0 42px;object-fit:cover;border-radius:6px;background:var(--bg2)}
+  .chat-file .vicon{display:flex;align-items:center;justify-content:center;color:var(--accent);font-size:11px}
+  .chat-file .fname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:125px}
+  .chat-file button{padding:2px 7px;font-size:12px;line-height:1.4}
+  .chat-picker{position:fixed;right:clamp(12px,1.2vw,24px);bottom:clamp(12px,1.2vw,24px);z-index:30;
+    display:none;align-items:center;gap:8px;max-width:calc(100vw - 24px);padding:9px 11px;
+    background:var(--panel);border:1px solid var(--line2);border-radius:14px;box-shadow:0 12px 36px rgba(0,0,0,.45)}
+  .chat-picker label{font-size:12px;color:var(--muted);white-space:nowrap;margin:0}
+  .chat-picker select{width:min(230px,42vw);padding:7px 9px;font-size:12.5px}
+  @media(max-width:640px){.chat-picker{left:12px;right:12px;justify-content:space-between}.chat-picker select{width:58vw}}
 </style>
 </head>
 <body>
@@ -288,6 +314,7 @@
 
   <nav class="tabs">
     <button class="active" data-t="pool">账号池</button>
+    <button data-t="chat">网页聊天</button>
     <button data-t="cookie">获取 Cookie</button>
     <button data-t="tasks">任务记录</button>
     <button data-t="media">媒体库</button>
@@ -390,6 +417,29 @@
       </table></div>
     </div>
   </section>
+
+  <!-- ==================== 网页聊天（主聊） ==================== -->
+  <section class="tab" id="tab-chat">
+    <div class="card">
+      <h3>网页聊天 <span class="tag">主聊 · 不使用 /thread/new</span></h3>
+      <div class="hint">先在右下角选择 Muse 账号（自动或指定），系统会打开该账号的主聊页面、加载最近几条消息，并在同一会话里继续聊天。可直接粘贴图片或视频（最多 10 个，单个 40 MiB）。</div>
+      <div class="chat-shell">
+        <div class="chat-log" id="chatMessages"><div class="chat-msg system" id="chatPlaceholder">请选择账号后加载主聊记录</div></div>
+        <div class="chat-attachments" id="chatAttachments"></div>
+        <div class="chat-composer">
+          <textarea id="chatInput" rows="3" placeholder="输入消息，或 Ctrl+V 粘贴图片/视频；Enter 发送，Shift+Enter 换行" disabled></textarea>
+          <button id="chatSend" onclick="sendChat()" disabled>发送</button>
+        </div>
+        <div class="hint" id="chatStatus" style="margin:0"></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="chat-picker" id="chatPicker">
+    <label for="chatAccount">Muse 账号</label>
+    <select id="chatAccount" onchange="openChat()"><option value="auto">自动（空闲账号）</option></select>
+    <button class="ghost mini" onclick="openChat(true)">重载</button>
+  </div>
 
   <!-- ==================== 获取 Cookie ==================== -->
   <section class="tab" id="tab-cookie">
@@ -822,6 +872,26 @@ function setLang(v){
 }
 /* 整句：中文 → 英文 */
 const I18N_EN = {
+  "网页聊天": "Web chat",
+  "主聊 · 不使用 /thread/new": "Main chat · not /thread/new",
+  "Muse 账号": "Muse account",
+  "自动（空闲账号）": "Auto (idle account)",
+  "重载": "Reload",
+  "发送": "Send",
+  "请选择账号后加载主聊记录": "Select an account to load main-chat history",
+  "正在读取主聊记录…": "Loading main-chat history…",
+  "该账号主聊暂无最近消息，可以直接开始对话": "No recent messages in this account's main chat; you can start a conversation now",
+  "主聊暂无历史，已打开新对话": "No main-chat history; a new conversation is open",
+  "已加载最近消息": "Recent messages loaded",
+  "Muse 正在回复…": "Muse is replying…",
+  "聊天只支持粘贴图片或视频": "Chat accepts pasted images or videos only",
+  "一次最多粘贴 10 个素材": "Up to 10 attachments per message",
+  "单个素材不能超过 40 MiB": "Each attachment is limited to 40 MiB",
+  "素材总大小不能超过 100 MiB": "Total attachments are limited to 100 MiB",
+  "读取粘贴的素材失败": "Failed to read the pasted attachment",
+  "粘贴的图片": "Pasted image",
+  "粘贴的视频": "Pasted video",
+  "移除": "Remove",
   "排队与生成时限": "Queue and generation timeouts",
   "排队不占用生成时限。任务获得并发槽位和账号后开始计算生成时间；重试时等待账号也不计入。": "Queue time does not consume the generation budget. Execution starts after acquiring a slot and account; retry account waits are excluded too.",
   "独立排队时限（秒，0 为不限）": "Separate queue timeout (seconds; 0 = unlimited)",
@@ -1563,6 +1633,14 @@ document.querySelectorAll('nav.tabs button').forEach(b => {
     if (b.dataset.t === 'tasks') loadTasks();
     if (b.dataset.t === 'media') loadMedia();
     if (b.dataset.t === 'cookie') $('cmdText').textContent = buildCmd($('inBase').value);
+    $('chatPicker').style.display = b.dataset.t === 'chat' ? 'flex' : 'none';
+    if (b.dataset.t === 'chat') {
+      fillChatAccounts();
+      if (!$('chatInput').dataset.ready) {
+        $('chatInput').dataset.ready = '1';
+        openChat();
+      }
+    }
   };
 });
 
@@ -2443,6 +2521,216 @@ async function loadStatus(){
     }
   }
 }
+
+/* ================= 网页聊天（主聊） ================= */
+let chatBusy = false;
+let chatFiles = [];
+const CHAT_FILE_MAX = 40 * 1024 * 1024;
+const CHAT_TOTAL_MAX = 100 * 1024 * 1024;
+
+async function fillChatAccounts(){
+  let list = [];
+  try { const d = await api('/admin/accounts'); list = d.accounts || []; }
+  catch (e) { list = Array.isArray(accounts) ? accounts : []; }
+  const sel = $('chatAccount');
+  const current = sel.value;
+  sel.innerHTML = '<option value="auto">自动（空闲账号）</option>';
+  list.filter(a => a.enabled !== false && a.essential_ok !== false).forEach(a => {
+    const o = document.createElement('option');
+    o.value = a.id;
+    o.textContent = (a.label || a.id) + (a.ok === false ? '（异常）' : '');
+    sel.appendChild(o);
+  });
+  if ([...sel.options].some(o => o.value === current)) sel.value = current;
+}
+
+function chatBubble(role, text){
+  const d = document.createElement('div');
+  d.className = 'chat-msg ' + (role === 'user' || role === 'assistant' ? role : 'system');
+  d.textContent = text || '';
+  return d;
+}
+
+function renderChatHistory(messages){
+  const box = $('chatMessages');
+  box.innerHTML = '';
+  const list = Array.isArray(messages) ? messages : [];
+  if (!list.length) box.appendChild(chatBubble('system', '该账号主聊暂无最近消息，可以直接开始对话'));
+  list.forEach(m => box.appendChild(chatBubble(m.role === 'user' ? 'user' : 'assistant', m.text)));
+  box.scrollTop = box.scrollHeight;
+}
+
+function renderChatAttachments(){
+  const box = $('chatAttachments');
+  box.innerHTML = '';
+  chatFiles.forEach((f, i) => {
+    const item = document.createElement('div');
+    item.className = 'chat-file';
+    const view = document.createElement(f.kind === 'image' ? 'img' : 'div');
+    if (f.kind === 'image') view.src = f.dataUrl;
+    else { view.className = 'vicon'; view.textContent = '视频'; }
+    const name = document.createElement('span');
+    name.className = 'fname';
+    name.textContent = f.name;
+    const del = document.createElement('button');
+    del.className = 'ghost mini';
+    del.type = 'button';
+    del.textContent = '×';
+    del.title = '移除';
+    del.onclick = () => { chatFiles.splice(i, 1); renderChatAttachments(); };
+    item.appendChild(view); item.appendChild(name); item.appendChild(del);
+    box.appendChild(item);
+  });
+}
+
+function addChatFile(file){
+  const name = file.name || '';
+  const isImage = /^image\//i.test(file.type) || /\.(png|jpe?g|gif|webp|heic|heif|avif)$/i.test(name);
+  const isVideo = /^video\//i.test(file.type) || /\.(mp4|mov|webm|3gp)$/i.test(name);
+  if (!isImage && !isVideo) { toast('聊天只支持粘贴图片或视频', 'bad'); return; }
+  if (chatFiles.length >= 10) { toast('一次最多粘贴 10 个素材', 'bad'); return; }
+  if (file.size > CHAT_FILE_MAX) { toast('单个素材不能超过 40 MiB', 'bad'); return; }
+  const total = chatFiles.reduce((n, f) => n + f.size, 0) + file.size;
+  if (total > CHAT_TOTAL_MAX) { toast('素材总大小不能超过 100 MiB', 'bad'); return; }
+  const reader = new FileReader();
+  reader.onload = () => {
+    chatFiles.push({name: name || (isImage ? '粘贴的图片' : '粘贴的视频'),
+      kind: isImage ? 'image' : 'video', dataUrl: String(reader.result || ''), size: file.size});
+    renderChatAttachments();
+    $('chatInput').disabled = false;
+    $('chatSend').disabled = false;
+  };
+  reader.onerror = () => toast('读取粘贴的素材失败', 'bad');
+  reader.readAsDataURL(file);
+}
+
+$('chatInput').addEventListener('paste', e => {
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  let hasMedia = false;
+  for (const item of items) {
+    if (item.kind !== 'file') continue;
+    const file = item.getAsFile();
+    if (!file) continue;
+    if ((item.type || '').startsWith('image/') || (item.type || '').startsWith('video/')
+        || /\.(png|jpe?g|gif|webp|heic|heif|avif|mp4|mov|webm|3gp)$/i.test(file.name || '')) {
+      addChatFile(file);
+      hasMedia = true;
+    }
+  }
+  if (hasMedia) e.preventDefault();
+});
+
+async function openChat(){
+  if (chatBusy) return;
+  chatBusy = true;
+  chatFiles = [];
+  renderChatAttachments();
+  $('chatInput').disabled = true;
+  $('chatSend').disabled = true;
+  $('chatStatus').textContent = '正在读取主聊记录…';
+  try {
+    const d = await api('/admin/chat/open', {
+      method: 'POST',
+      body: JSON.stringify({account_id: $('chatAccount').value, limit: 20})
+    });
+    renderChatHistory(d.messages);
+    const emptyHistory = !d.path || d.path.indexOf('thread/new') >= 0;
+    $('chatStatus').textContent = '已选择：' + (d.account.label || d.account.id)
+      + (emptyHistory ? '（主聊暂无历史，已打开新对话）' : '（已加载最近消息）');
+    $('chatInput').disabled = false;
+    $('chatSend').disabled = false;
+    $('chatInput').focus();
+  } catch (e) {
+    renderChatHistory([]);
+    $('chatStatus').textContent = '';
+    toast('读取主聊失败：' + e.message, 'bad');
+  } finally {
+    chatBusy = false;
+  }
+}
+
+async function sendChat(){
+  if (chatBusy) return;
+  const message = $('chatInput').value.trim();
+  if (!message && !chatFiles.length) return;
+  chatBusy = true;
+  const attached = chatFiles.slice();
+  const images = attached.filter(f => f.kind === 'image').map(f => f.dataUrl);
+  const videos = attached.filter(f => f.kind === 'video').map(f => f.dataUrl);
+  $('chatInput').value = '';
+  chatFiles = [];
+  renderChatAttachments();
+  $('chatInput').disabled = true;
+  $('chatSend').disabled = true;
+  const box = $('chatMessages');
+  box.appendChild(chatBubble('user', (message || '请查看我刚上传的附件并回复。')
+    + (attached.length ? '\n[附件 × ' + attached.length + ']' : '')));
+  const pending = chatBubble('assistant', '');
+  box.appendChild(pending);
+  box.scrollTop = box.scrollHeight;
+  $('chatStatus').textContent = 'Muse 正在回复…';
+
+  let answer = '';
+  let finished = false;
+  try {
+    const headers = {'Content-Type': 'application/json'};
+    if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+    const r = await fetch('/admin/chat/send', {
+      method: 'POST', headers,
+      body: JSON.stringify({account_id: $('chatAccount').value, message,
+        images: images.length ? images : undefined,
+        videos: videos.length ? videos : undefined, limit: 20})
+    });
+    if (r.status === 401) { setAuth(false); throw new Error('API Key 未填写或填写错误'); }
+    if (!r.ok) {
+      let msg = 'HTTP ' + r.status;
+      try { const j = await r.json(); msg = j.detail || j.message || msg; } catch (e) {}
+      throw new Error(msg);
+    }
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      let at;
+      while ((at = buffer.indexOf('\n\n')) >= 0) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        const line = frame.split('\n').find(x => x.indexOf('data:') === 0);
+        if (!line) continue;
+        let ev;
+        try { ev = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+        if (ev.type === 'delta') {
+          answer += ev.text || '';
+          pending.textContent = answer;
+          box.scrollTop = box.scrollHeight;
+        } else if (ev.type === 'done') {
+          finished = true;
+          $('chatStatus').textContent = '已回复 · 账号 ' + (ev.account.label || ev.account.id);
+        } else if (ev.type === 'error') {
+          throw new Error(ev.message || '生成失败');
+        }
+      }
+    }
+    if (!finished) $('chatStatus').textContent = '连接已结束，可点「重载」确认最新记录';
+  } catch (e) {
+    if (attached.length) { chatFiles = attached.concat(chatFiles); renderChatAttachments(); }
+    $('chatStatus').textContent = '';
+    pending.textContent = answer ? answer + '\n（回复中断：' + e.message + '）' : '发送失败：' + e.message;
+    toast('聊天失败：' + e.message, 'bad');
+  } finally {
+    chatBusy = false;
+    $('chatInput').disabled = false;
+    $('chatSend').disabled = false;
+    $('chatInput').focus();
+  }
+}
+$('chatInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+});
 
 function refreshAll(){ loadStatus(); loadPool(); loadApikey(); loadRepoStatus(false); }
 

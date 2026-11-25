@@ -558,6 +558,122 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
         stop_event.set()
 
 
+# ------------------------- 管理：网页聊天（主聊） -------------------------
+class AdminChatOpenReq(BaseModel):
+    account_id: str | None = "auto"
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class AdminChatSendReq(BaseModel):
+    account_id: str | None = "auto"
+    message: str = ""
+    images: list[Any] | None = None
+    videos: list[Any] | None = None
+    limit: int = Field(default=20, ge=1, le=100)
+    timeout: int | None = Field(default=None, ge=10, le=600)
+
+    @model_validator(mode="after")
+    def _has_content(self):
+        if not self.message.strip() and not self.images and not self.videos:
+            raise ValueError("请输入消息或粘贴图片/视频")
+        return self
+
+
+def _admin_chat_account(account_id: str | None) -> dict:
+    """自动模式挑空闲账号；指定账号时严格使用用户选中的那个。"""
+    try:
+        if not account_id or account_id == "auto":
+            return ACCOUNT_POOL.acquire(rotate=True, timeout=30)
+        return ACCOUNT_POOL.acquire(account_id=account_id, timeout=30)
+    except (MuseAuthError, MuseGenerationError) as exc:
+        raise HTTPException(409, str(exc)) from None
+
+
+def _admin_chat_account_view(acc: dict) -> dict:
+    return {"id": acc["id"], "label": acc.get("label", acc["id"]),
+            "ok": acc.get("ok")}
+
+
+def _admin_chat_page_path() -> str:
+    try:
+        return str(engine.page.js("location.pathname") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def admin_chat_stream(account_id: str | None, message: str, timeout: int, limit: int,
+                      references: list[str] | None = None):
+    """在选定账号的主聊里发送一条消息，产出 SSE 事件字典。"""
+    q: queue.Queue = queue.Queue()
+    stop_event = threading.Event()
+
+    def worker():
+        leased = None
+        slot_acquired = False
+        try:
+            slot_acquired = GEN_LOCK.acquire(timeout=30)
+            if not slot_acquired:
+                q.put(("error", HTTPException(429, "等待生成槽位超时，请稍后再试")))
+                return
+            leased = _admin_chat_account(account_id)
+            _bind_account_proxy(store.get_account(leased["id"]) or {})
+            refreshed = _renew_and_persist(leased["id"], wake_vm=True)
+            source = refreshed or leased
+            engine.start()
+            for chunk in engine.chat_stream(
+                source["cookies"], message, source.get("cookies_exp"), timeout,
+                account_id=leased["id"], stop_event=stop_event, main_chat=True,
+                references=references
+            ):
+                q.put(("delta", chunk))
+            path = _admin_chat_page_path()
+            messages = engine.main_chat_history(limit)
+            store.mark(leased["id"], True, "")
+            _sync_cookies(leased["id"])
+            q.put(("done", {"account": _admin_chat_account_view(leased),
+                            "messages": messages, "path": path}))
+        except HTTPException as exc:
+            q.put(("error", exc))
+        except MuseAuthError as exc:
+            if leased:
+                store.mark(leased["id"], False, str(exc))
+            q.put(("error", exc))
+        except Exception as exc:  # noqa: BLE001
+            q.put(("error", exc))
+        finally:
+            try:
+                if leased:
+                    ACCOUNT_POOL.release(leased["id"])
+                engine.close_current_page()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("网页聊天清理失败: %s", type(exc).__name__)
+            finally:
+                try:
+                    _clear_account_proxy()
+                finally:
+                    if slot_acquired:
+                        GEN_LOCK.release()
+                    q.put(("end", None))
+
+    threading.Thread(target=worker, daemon=True).start()
+    failed = False
+    try:
+        while True:
+            kind, val = q.get()
+            if kind == "delta" and not failed:
+                yield {"type": "delta", "text": val}
+            elif kind == "done" and not failed:
+                yield {"type": "done", **val}
+            elif kind == "error":
+                failed = True
+                yield {"type": "error",
+                       "message": str(getattr(val, "detail", val))}
+            elif kind == "end":
+                break
+    finally:
+        stop_event.set()
+
+
 class ImageRequest(BaseModel):
     prompt: str
     model: str = "muse-image"
@@ -2124,6 +2240,66 @@ def admin_status(_=Depends(auth)):
                    "host": CFG.host, "port": CFG.port,
                    "public_base": base},
     }
+
+
+# ------------------------- 管理：网页聊天（主聊） -------------------------
+@app.post("/admin/chat/open")
+async def admin_chat_open(req: AdminChatOpenReq, _=Depends(auth)):
+    """选择账号后打开其主聊，返回最近几条消息。"""
+    def run():
+        leased = None
+        slot_acquired = False
+        try:
+            slot_acquired = GEN_LOCK.acquire(timeout=30)
+            if not slot_acquired:
+                raise HTTPException(429, "等待生成槽位超时，请稍后再试")
+            leased = _admin_chat_account(req.account_id)
+            _bind_account_proxy(store.get_account(leased["id"]) or {})
+            refreshed = _renew_and_persist(leased["id"], wake_vm=True)
+            source = refreshed or leased
+            engine.start()
+            engine.open_main_chat(source["cookies"], source.get("cookies_exp"),
+                                  account_id=leased["id"])
+            return {"account": _admin_chat_account_view(leased),
+                    "messages": engine.main_chat_history(req.limit),
+                    "path": _admin_chat_page_path()}
+        except HTTPException:
+            raise
+        except (MuseAuthError, MuseGenerationError) as exc:
+            raise HTTPException(502, str(exc)) from None
+        finally:
+            try:
+                if leased:
+                    ACCOUNT_POOL.release(leased["id"])
+                engine.close_current_page()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("主聊读取清理失败: %s", type(exc).__name__)
+            finally:
+                try:
+                    _clear_account_proxy()
+                finally:
+                    if slot_acquired:
+                        GEN_LOCK.release()
+
+    return await asyncio.to_thread(run)
+
+
+@app.post("/admin/chat/send")
+async def admin_chat_send(req: AdminChatSendReq, _=Depends(auth)):
+    """在选定账号的主聊中继续对话，流式返回助手增量。"""
+    timeout = int(req.timeout or CFG.chat_timeout)
+    refs = _reference_list(req.images, [], "images", {"videos": req.videos})
+    prepared = _prepare_reference_images(refs)
+    message = req.message.strip() or ("请查看我刚上传的附件并回复。"
+                                      if prepared else "")
+
+    def events():
+        for item in admin_chat_stream(req.account_id, message, timeout,
+                                      req.limit, prepared):
+            yield _sse(item)
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers=_SSE_HEADERS)
 
 
 # ------------------------- 管理：账号池 -------------------------

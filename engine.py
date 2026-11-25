@@ -869,9 +869,49 @@ class MuseEngine:
                                 "请用浏览器扩展重新导入 cookie")
         raise MuseGenerationError("muse.ai 页面加载超时（未出现聊天输入框），请检查服务器网络后重试；未确认会话失效")
 
+    def open_main_chat(self, cookies: dict, expires: dict | None = None,
+                       account_id: str | None = None):
+        """打开账号的主聊页面（muse.ai 首页），而不是隔离的 /thread/new。"""
+        page = self.ensure_page(cookies, expires, account_id=account_id)
+        try:
+            path = str(page.js("location.pathname") or "")
+        except Exception:  # noqa: BLE001
+            path = ""
+        if path.rstrip("/"):
+            page.send("Page.navigate", {"url": self.cfg.site_url})
+            t_end = time.time() + 20.0
+            while time.time() < t_end:
+                time.sleep(0.1)
+                try:
+                    ready = (page.js("document.readyState === 'complete' "
+                                     "&& !!document.querySelector('textarea')"))
+                except Exception:  # noqa: BLE001
+                    ready = False
+                if ready:
+                    break
+            else:
+                raise MuseGenerationError("muse.ai 主聊页面加载超时（未出现聊天输入框）")
+            self._wait_ws_ready(page, timeout=12.0)
+        # 主聊历史是异步渲染的，给最近几条消息一点时间上屏。
+        t_hist = time.time() + 6.0
+        while time.time() < t_hist:
+            try:
+                n = int(page.js("document.querySelectorAll("
+                                "'div[class*=\"hatch-chat-groupable-bubble\"]').length") or 0)
+            except Exception:  # noqa: BLE001
+                n = 0
+            if n:
+                break
+            time.sleep(0.15)
+        return page
+
     def close_current_page(self):
         """显式释放当前线程所持有的页面和隔离上下文。"""
         self._close_page()
+        local = self._ensure_local()
+        for path in (getattr(local, "upload_dirs", None) or []):
+            shutil.rmtree(path, ignore_errors=True)
+        local.upload_dirs = []
 
     def refresh(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
         self._close_page()
@@ -1559,6 +1599,21 @@ class MuseEngine:
         "||document.querySelector('button[aria-label*=\"停止\"]'));"
         "return JSON.stringify({cnt:nonEmpty.length,total:bs.length,txt:txt,stop:stop});})()"
     )
+    _MAIN_HISTORY_JS = (
+        "(function(limit){"
+        "var bs=[].slice.call(document.querySelectorAll("
+        "'div[class*=\"hatch-chat-groupable-bubble\"]'));"
+        "var out=[];"
+        "for(var i=0;i<bs.length;i++){"
+        "var c=bs[i].className||'';"
+        "var role=/chat-user-bubble/.test(c)?'user':"
+        "(/hatch-agent-bubble-bg/.test(c)?'assistant':null);"
+        "if(!role)continue;"
+        "var t=(bs[i].innerText||'').trim();"
+        "if(!t)continue;"
+        "out.push({role:role,text:t.slice(0,20000)});}"
+        "return JSON.stringify(out.slice(-limit));})(%s)"
+    )
 
     def _agent_text(self) -> str:
         """最后一个助手气泡的文本（取不到就返回空串）。"""
@@ -1589,13 +1644,40 @@ class MuseEngine:
             pass
         return 0, "", False
 
+    def main_chat_history(self, limit: int = 20) -> list[dict]:
+        """读取主聊页面最近若干条消息（role=user/assistant）。"""
+        page = self.page
+        if not page:
+            return []
+        try:
+            raw = page.js(self._MAIN_HISTORY_JS % max(1, min(int(limit), 100)))
+            items = json.loads(raw) if raw else []
+            return [m for m in items
+                    if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+        except Exception:  # noqa: BLE001
+            return []
+
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
-                    stop_event=None):
-        """发一条消息，流式 yield 增量文本。"""
+                    stop_event=None, main_chat: bool = False,
+                    references: list[str] | None = None):
+        """发一条消息，流式 yield 增量文本。
+
+        main_chat=True 时留在账号的主聊页面继续已有会话，不切到 /thread/new；
+        references 是已校验的 data URL，会在发消息前附加到当前输入框。
+        """
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
-        self.ensure_page(cookies, expires, account_id=account_id)
-        self.reset_thread(for_chat=True)
+        if main_chat:
+            self.open_main_chat(cookies, expires, account_id=account_id)
+        else:
+            self.ensure_page(cookies, expires, account_id=account_id)
+            self.reset_thread(for_chat=True)
+        if references:
+            self._scroll_bottom()
+            upload = self._attach_images(references)
+            if upload:
+                local = self._ensure_local()
+                local.upload_dirs = list(getattr(local, "upload_dirs", None) or []) + [upload["dir"]]
         base_agent, base_text, _ = self._poll_chat()
         self._send(prompt)
 
