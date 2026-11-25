@@ -1720,19 +1720,36 @@ class MuseEngine:
         return 0, "", False
 
     def _cdp_media_sources(self) -> list[dict]:
-        """用 CDP DOM 域穿透 Shadow DOM，找出页面里的 img/video 源。"""
+        """用 CDP DOM 域穿透 Shadow DOM 与 iframe，找出页面里的 img/video 源。"""
         page = self.page
         if not page:
             return []
         out: list[dict] = []
+        node_ids: list[int] = []
         try:
-            doc = page.send("DOM.getDocument", {"depth": -1, "pierce": True}, timeout=30)
-            root = ((doc.get("result") or {}).get("root") or {}).get("nodeId")
-            if not root:
-                return []
-            found = page.send("DOM.querySelectorAll",
-                              {"nodeId": root, "selector": "img,video"}, timeout=30)
-            node_ids = (found.get("result") or {}).get("nodeIds") or []
+            tree = page.send("Page.getFrameTree", timeout=15)
+            frames: list[str | None] = []
+
+            def walk(frame):
+                if not frame:
+                    return
+                frames.append(frame.get("frameId"))
+                for child in (frame.get("childFrames") or []):
+                    walk(child)
+            walk((tree.get("result") or {}).get("frameTree"))
+            if not frames:
+                frames = [None]
+            for frame_id in frames:
+                args = {"depth": -1, "pierce": True}
+                if frame_id:
+                    args["frameId"] = frame_id
+                doc = page.send("DOM.getDocument", args, timeout=30)
+                root = ((doc.get("result") or {}).get("root") or {}).get("nodeId")
+                if not root:
+                    continue
+                found = page.send("DOM.querySelectorAll",
+                                  {"nodeId": root, "selector": "img,video"}, timeout=30)
+                node_ids.extend((found.get("result") or {}).get("nodeIds") or [])
         except Exception as exc:  # noqa: BLE001
             log.warning("CDP 媒体节点扫描失败: %s", type(exc).__name__)
             return []
@@ -1763,6 +1780,10 @@ class MuseEngine:
                             "cls": info.get("cls", "")})
             except Exception:  # noqa: BLE001
                 continue
+        log.info("CDP 原始媒体节点 %s 个: %s", len(out),
+                 [{"tag": m.get("tag"), "w": m.get("w"), "h": m.get("h"),
+                   "cls": (m.get("cls") or "")[:60], "src": str(m.get("src") or "")[:70]}
+                  for m in out[:10]])
         return out
 
     def _scan_history_dom_media(self) -> list[dict]:
