@@ -209,7 +209,13 @@
   /* ---------- 网页聊天（主聊） ---------- */
   .chat-shell{display:flex;flex-direction:column;gap:12px}
   .chat-layout{display:flex;gap:14px;align-items:flex-start}
-  .chat-main{flex:1;min-width:0}
+  .chat-main{flex:1;min-width:0;position:relative}
+  .chat-loading{position:absolute;inset:0;z-index:8;display:none;align-items:center;justify-content:center;
+    flex-direction:column;gap:10px;background:rgba(11,15,25,.78);border-radius:var(--radius);
+    color:var(--text);font-size:13px;backdrop-filter:blur(2px)}
+  .chat-loading.show{display:flex}
+  .chat-loading .spin{width:26px;height:26px;border-radius:50%;border:2px solid var(--line2);
+    border-top-color:var(--accent);animation:sp .8s linear infinite}
   .chat-accounts{position:sticky;top:16px;width:230px;flex:0 0 230px;max-height:calc(100vh - 32px);overflow-y:auto;
     padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius)}
   .chat-accounts h4{margin:2px 4px 10px;font-size:12px;color:var(--muted);font-weight:600;letter-spacing:.04em}
@@ -233,7 +239,7 @@
   .chat-msg img,.chat-msg video{display:block;max-width:100%;max-height:280px;border-radius:8px;margin-top:8px;background:var(--bg2)}
   .chat-msg .chat-media-note{display:block;margin-top:6px;color:var(--muted);font-size:11.5px}
   .chat-composer{display:flex;gap:10px;align-items:flex-end}
-  .chat-composer textarea{flex:1;min-height:76px;max-height:220px}
+  .chat-composer textarea{flex:1;width:auto;height:80px;min-height:80px;max-height:220px;resize:vertical}
   .chat-attachments{display:flex;flex-wrap:wrap;gap:8px}
   .chat-attachments:empty{display:none}
   .chat-file{display:flex;align-items:center;gap:8px;max-width:240px;padding:6px 8px;background:var(--panel);
@@ -415,6 +421,7 @@
     <div class="chat-layout">
       <aside class="chat-accounts" id="chatAccounts"><h4>账号 · 使用额度</h4></aside>
       <div class="card chat-main">
+        <div class="chat-loading" id="chatLoading"><div class="spin"></div><span>正在加载聊天记录…</span></div>
         <h3>网页聊天 <span class="tag">主聊 · 不使用 /thread/new</span></h3>
         <div class="hint">点击左侧账号即可打开该账号的主聊、加载最近消息并在同一会话继续聊天；「自动」由系统挑空闲账号。可直接粘贴图片或视频（最多 10 个，单个 40 MiB）。</div>
         <div class="chat-shell">
@@ -877,6 +884,7 @@ const I18N_EN = {
   "已加载最近消息": "Recent messages loaded",
   "Muse 正在回复…": "Muse is replying…",
   "等待回复超时（10 分钟）": "Reply timed out after 10 minutes",
+  "正在加载聊天记录…": "Loading chat history…",
   "聊天只支持粘贴图片或视频": "Chat accepts pasted images or videos only",
   "一次最多粘贴 10 个素材": "Up to 10 attachments per message",
   "单个素材不能超过 40 MiB": "Each attachment is limited to 40 MiB",
@@ -2524,6 +2532,14 @@ const CHAT_FILE_MAX = 40 * 1024 * 1024;
 const CHAT_TOTAL_MAX = 100 * 1024 * 1024;
 const CHAT_REPLY_TIMEOUT_MS = 10 * 60 * 1000;
 
+function setChatLoading(on){
+  const mask = $('chatLoading');
+  if (mask) mask.classList.toggle('show', !!on);
+  document.querySelectorAll('#chatAccounts .chat-account-item').forEach(btn => {
+    btn.disabled = !!on;
+  });
+}
+
 function selectChatAccount(id){
   if (chatBusy) return;
   chatAccountId = id;
@@ -2544,6 +2560,7 @@ async function fillChatAccounts(){
     btn.type = 'button';
     btn.className = 'chat-account-item' + (chatAccountId === id ? ' active' : '');
     btn.dataset.id = id;
+    btn.disabled = chatBusy;
     const name = document.createElement('span');
     name.className = 'ca-name';
     name.textContent = label;
@@ -2669,6 +2686,7 @@ $('chatInput').addEventListener('paste', e => {
 async function openChat(){
   if (chatBusy) return;
   chatBusy = true;
+  setChatLoading(true);
   chatFiles = [];
   renderChatAttachments();
   $('chatInput').disabled = true;
@@ -2695,6 +2713,7 @@ async function openChat(){
     $('chatStatus').textContent = '';
     toast('读取主聊失败：' + e.message, 'bad');
   } finally {
+    setChatLoading(false);
     chatBusy = false;
   }
 }
