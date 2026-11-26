@@ -423,9 +423,9 @@
       <div class="card chat-main">
         <div class="chat-loading" id="chatLoading"><div class="spin"></div><span>正在加载聊天记录…</span></div>
         <h3>网页聊天 <span class="tag">主聊 · 不使用 /thread/new</span></h3>
-        <div class="hint">点击左侧账号即可打开该账号的主聊、加载最近消息并在同一会话继续聊天；「自动」由系统挑空闲账号。可直接粘贴图片或视频（最多 10 个，单个 40 MiB）。</div>
+        <div class="hint">点击左侧具体账号即可打开该账号的主聊、加载最近消息并在同一会话继续聊天；「默认」不会加载任何内容。可直接粘贴图片或视频（最多 10 个，单个 40 MiB）。</div>
         <div class="chat-shell">
-          <div class="chat-log" id="chatMessages"><div class="chat-msg system" id="chatPlaceholder">请选择账号后加载主聊记录</div></div>
+          <div class="chat-log" id="chatMessages"><div class="chat-msg system">点击左侧具体账号加载聊天记录</div></div>
           <div class="chat-attachments" id="chatAttachments"></div>
           <div class="chat-composer">
             <textarea id="chatInput" rows="3" placeholder="输入消息，或 Ctrl+V 粘贴图片/视频；Enter 发送，Shift+Enter 换行" disabled></textarea>
@@ -874,7 +874,10 @@ const I18N_EN = {
   "网页聊天": "Web chat",
   "主聊 · 不使用 /thread/new": "Main chat · not /thread/new",
   "Muse 账号": "Muse account",
-  "自动（空闲账号）": "Auto (idle account)",
+  "默认": "Default",
+  "点击真实账号加载": "Select a real account to load",
+  "点击左侧具体账号加载聊天记录": "Select a specific account on the left to load chat history",
+  "请先在左侧选择具体账号": "Select a specific account on the left first",
   "重载": "Reload",
   "发送": "Send",
   "请选择账号后加载主聊记录": "Select an account to load main-chat history",
@@ -1638,7 +1641,7 @@ document.querySelectorAll('nav.tabs button').forEach(b => {
       fillChatAccounts();
       if (!$('chatInput').dataset.ready) {
         $('chatInput').dataset.ready = '1';
-        openChat();
+        resetChatToDefault();
       }
     }
   };
@@ -2527,7 +2530,7 @@ async function loadStatus(){
 /* ================= 网页聊天（主聊） ================= */
 let chatBusy = false;
 let chatFiles = [];
-let chatAccountId = 'auto';
+let chatAccountId = 'default';
 const CHAT_FILE_MAX = 40 * 1024 * 1024;
 const CHAT_TOTAL_MAX = 100 * 1024 * 1024;
 const CHAT_REPLY_TIMEOUT_MS = 10 * 60 * 1000;
@@ -2540,13 +2543,25 @@ function setChatLoading(on){
   });
 }
 
+function resetChatToDefault(){
+  chatFiles = [];
+  renderChatAttachments();
+  const box = $('chatMessages');
+  box.innerHTML = '';
+  box.appendChild(chatBubble('system', '点击左侧具体账号加载聊天记录'));
+  $('chatInput').disabled = true;
+  $('chatSend').disabled = true;
+  $('chatStatus').textContent = '';
+}
+
 function selectChatAccount(id){
   if (chatBusy) return;
   chatAccountId = id;
   document.querySelectorAll('#chatAccounts .chat-account-item').forEach(el => {
     el.classList.toggle('active', el.dataset.id === id);
   });
-  openChat();
+  if (id === 'default') resetChatToDefault();
+  else openChat();
 }
 
 async function fillChatAccounts(){
@@ -2571,7 +2586,7 @@ async function fillChatAccounts(){
     btn.onclick = () => selectChatAccount(id);
     box.appendChild(btn);
   };
-  add('auto', '自动（空闲账号）', '由系统选择');
+  add('default', '默认', '点击真实账号加载');
   list.filter(a => a.enabled !== false && a.essential_ok !== false).forEach(a => {
     const q = a.quota;
     const pct = (q && q.found && q.weekly_used_pct != null) ? q.weekly_used_pct : null;
@@ -2720,6 +2735,7 @@ async function openChat(){
 
 async function sendChat(){
   if (chatBusy) return;
+  if (chatAccountId === 'default') { toast('请先在左侧选择具体账号', 'warn'); return; }
   const message = $('chatInput').value.trim();
   if (!message && !chatFiles.length) return;
   chatBusy = true;
