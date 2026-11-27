@@ -925,8 +925,8 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             pass
         t_bubble = time.monotonic()
-        # 历史图片常比文字晚渲染；这里只做轻量 JS 查询，不做 CDP 节点扫描。
-        t_media = time.time() + 3.0
+        # 历史图片/视频常比文字晚 4~6 秒才渲染；只做轻量 JS 查询，不做 CDP 节点扫描。
+        t_media = time.time() + 8.0
         while time.time() < t_media:
             try:
                 if self._has_history_media():
@@ -1657,11 +1657,13 @@ class MuseEngine:
         "return JSON.stringify(out.slice(-limit));})(%s)"
     )
     _HISTORY_MEDIA_PRESENCE_JS = r"""(function(){
-      var roots=[].slice.call(document.querySelectorAll(
-        'main,[class*="chat-scroll"],[class*="hatch-chat-scroll"]'));
-      if(!roots.length)roots=[document];
-      for(var i=0;i<roots.length;i++){
-        if(roots[i].querySelector('img,video,[style*=background-image]'))return true;
+      var els=document.querySelectorAll('img,video,[style*=background-image]');
+      for(var i=0;i<els.length;i++){
+        var el=els[i];
+        if(el.closest('aside,nav,header,footer,[role="navigation"]'))continue;
+        var w=el.naturalWidth||el.videoWidth||el.clientWidth||0;
+        var h=el.naturalHeight||el.videoHeight||el.clientHeight||0;
+        if(w>=80&&h>=80)return true;
       }
       return false;
     })()"""
@@ -1718,7 +1720,7 @@ class MuseEngine:
         msgs[i].media.push({kind:kind,src:src,w:w||0,h:h||0});
       }
       var roots=[].slice.call(document.querySelectorAll(
-        'main,[class*="chat-scroll"],[class*="hatch-chat-scroll"]'));
+        'main,[class*="chat-scroll"],[class*="hatch-chat-scroll"],[role="dialog"],[class*="modal"],[class*="overlay"]'));
       if(!roots.length)roots=[document];
       function scan(root){
         if(!root||!root.querySelectorAll)return;
