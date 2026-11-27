@@ -886,6 +886,7 @@ class MuseEngine:
     def open_main_chat(self, cookies: dict, expires: dict | None = None,
                        account_id: str | None = None):
         """打开账号的主聊页面（muse.ai 首页），而不是隔离的 /thread/new。"""
+        t0 = time.monotonic()
         page = self.ensure_page(cookies, expires, account_id=account_id,
                                 target_url=self.cfg.site_url)
         try:
@@ -907,8 +908,9 @@ class MuseEngine:
             else:
                 raise MuseGenerationError("muse.ai 主聊页面加载超时（未出现聊天输入框）")
             self._wait_ws_ready(page, timeout=12.0, relaxed=True)
+        t_page = time.monotonic()
         # 主聊历史是异步渲染的，给最近几条消息一点时间上屏。
-        t_hist = time.time() + 6.0
+        t_hist = time.time() + 4.0
         while time.time() < t_hist:
             try:
                 n = int(page.js("document.querySelectorAll("
@@ -922,15 +924,19 @@ class MuseEngine:
             log.info("主聊页面 URL: %s", page.js("location.href"))
         except Exception:  # noqa: BLE001
             pass
-        # 历史图片常比文字晚渲染，最多再等 8 秒。
-        t_media = time.time() + 8.0
+        t_bubble = time.monotonic()
+        # 历史图片常比文字晚渲染；这里只做轻量 JS 查询，不做 CDP 节点扫描。
+        t_media = time.time() + 3.0
         while time.time() < t_media:
             try:
                 if self._has_history_media():
                     break
             except Exception:  # noqa: BLE001
                 pass
-            time.sleep(0.5)
+            time.sleep(0.2)
+        log.info("主聊打开耗时 %.1fs（页面 %.1fs，气泡 %.1fs，媒体 %.1fs）",
+                 time.monotonic() - t0, t_page - t0, t_bubble - t_page,
+                 time.monotonic() - t_bubble)
         return page
 
     def close_current_page(self):
@@ -1650,6 +1656,15 @@ class MuseEngine:
         "out.push({role:role,text:t.slice(0,20000),media:media});}"
         "return JSON.stringify(out.slice(-limit));})(%s)"
     )
+    _HISTORY_MEDIA_PRESENCE_JS = r"""(function(){
+      var roots=[].slice.call(document.querySelectorAll(
+        'main,[class*="chat-scroll"],[class*="hatch-chat-scroll"]'));
+      if(!roots.length)roots=[document];
+      for(var i=0;i<roots.length;i++){
+        if(roots[i].querySelector('img,video,[style*=background-image]'))return true;
+      }
+      return false;
+    })()"""
     _HISTORY_MAPPED_JS = r"""(function(limit){
       var bubbles=[].slice.call(document.querySelectorAll(
         'div[class*="hatch-chat-groupable-bubble"]'));
@@ -1730,7 +1745,7 @@ class MuseEngine:
     })(%s)"""
     _HISTORY_MEDIA_JS = r"""(function(items,maxBytes){
       return Promise.all(items.map(function(it){
-        return new Promise(function(resolve){
+        var work = new Promise(function(resolve){
           fetch(it.src).then(function(r){
             if(!r.ok) throw new Error('HTTP '+r.status);
             return r.blob();
@@ -1748,6 +1763,11 @@ class MuseEngine:
             resolve({i:it.i,kind:it.kind,src:it.src,error:String(e&&e.message||e)});
           });
         });
+        return Promise.race([work, new Promise(function(resolve){
+          setTimeout(function(){
+            resolve({i:it.i,kind:it.kind,src:it.src,error:'timeout'});
+          }, 15000);
+        })]);
       }));
     })(%s, %s)"""
     _HISTORY_DOM_JS = r"""(function(){
@@ -1906,13 +1926,20 @@ class MuseEngine:
         return items
 
     def _has_history_media(self) -> bool:
-        return bool(self._scan_history_dom_media(quiet=True))
+        page = self.page
+        if not page:
+            return False
+        try:
+            return bool(page.js(self._HISTORY_MEDIA_PRESENCE_JS))
+        except Exception:  # noqa: BLE001
+            return False
 
     def main_chat_history(self, limit: int = 20, with_media: bool = False) -> list[dict]:
         """读取主聊页面最近若干条消息；with_media 时把气泡里的 blob 媒体转成 data URL。"""
         page = self.page
         if not page:
             return []
+        t0 = time.monotonic()
         capped_limit = max(1, min(int(limit), 100))
         items: list[dict] = []
         try:
@@ -1920,7 +1947,8 @@ class MuseEngine:
             data = json.loads(raw) if raw else None
             if isinstance(data, dict):
                 items = data.get("messages") or []
-                log.info("主聊气泡媒体映射: %s", data.get("stats") or {})
+                log.info("主聊气泡媒体映射: %s（耗时 %.1fs）",
+                         data.get("stats") or {}, time.monotonic() - t0)
             else:
                 items = data or []
         except Exception as exc:  # noqa: BLE001
@@ -1936,6 +1964,8 @@ class MuseEngine:
             items = [m for m in items
                      if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
         if not with_media:
+            log.info("主聊历史读取耗时 %.1fs（仅文字，%s 条）",
+                     time.monotonic() - t0, len(items))
             return items
         wanted = []
         # 从最新消息往前取，避免名额被更早的历史图片占满。
@@ -1952,11 +1982,13 @@ class MuseEngine:
             if len(wanted) >= MAX_HISTORY_MEDIA_ITEMS:
                 break
         if not wanted:
+            log.info("主聊历史读取耗时 %.1fs（无媒体，%s 条）",
+                     time.monotonic() - t0, len(items))
             return items
         try:
             raw = page.js(self._HISTORY_MEDIA_JS % (
                 json.dumps(wanted), MAX_HISTORY_MEDIA_BYTES),
-                await_promise=True, timeout=60)
+                await_promise=True, timeout=20)
             loaded = raw if isinstance(raw, list) else (json.loads(raw) if raw else [])
         except Exception as exc:  # noqa: BLE001
             log.warning("读取主聊历史媒体失败: %s", type(exc).__name__)
@@ -2003,6 +2035,8 @@ class MuseEngine:
                 key = (index, str(med.get("src") or ""))
                 merged.append(resolved.get(key, med))
             msg["media"] = merged
+        log.info("主聊历史读取耗时 %.1fs（消息 %s，媒体 %s）",
+                 time.monotonic() - t0, len(items), len(wanted))
         return items
 
     def wait_new_chat_attachment(self, timeout: float = 3.0) -> bool:

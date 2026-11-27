@@ -238,6 +238,8 @@
   .chat-msg.system{align-self:center;color:var(--muted);font-size:12px;background:transparent;border:0;padding:4px}
   .chat-msg img,.chat-msg video{display:block;max-width:100%;max-height:280px;border-radius:8px;margin-top:8px;background:var(--bg2)}
   .chat-msg .chat-media-note{display:block;margin-top:6px;color:var(--muted);font-size:11.5px}
+  .chat-status-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .chat-status-row button{flex:0 0 auto}
   .chat-composer{display:flex;gap:10px;align-items:flex-end}
   .chat-composer textarea{flex:1;width:auto;height:80px;min-height:80px;max-height:220px;resize:vertical}
   .chat-attachments{display:flex;flex-wrap:wrap;gap:8px}
@@ -423,7 +425,7 @@
       <div class="card chat-main">
         <div class="chat-loading" id="chatLoading"><div class="spin"></div><span>正在加载聊天记录…</span></div>
         <h3>网页聊天 <span class="tag">主聊 · 不使用 /thread/new</span></h3>
-        <div class="hint">点击左侧具体账号即可打开该账号的主聊、加载最近消息并在同一会话继续聊天；「默认」不会加载任何内容。可直接粘贴图片或视频（最多 10 个，单个 40 MiB）。</div>
+        <div class="hint">点击左侧具体账号仅选中，点击「加载历史聊天」后才载入该账号主聊记录；「默认」不会加载任何内容。可直接粘贴图片或视频（最多 10 个，单个 40 MiB）。</div>
         <div class="chat-shell">
           <div class="chat-log" id="chatMessages"><div class="chat-msg system">点击左侧具体账号加载聊天记录</div></div>
           <div class="chat-attachments" id="chatAttachments"></div>
@@ -431,7 +433,10 @@
             <textarea id="chatInput" rows="3" placeholder="输入消息，或 Ctrl+V 粘贴图片/视频；Enter 发送，Shift+Enter 换行" disabled></textarea>
             <button id="chatSend" onclick="sendChat()" disabled>发送</button>
           </div>
-          <div class="hint" id="chatStatus" style="margin:0"></div>
+          <div class="chat-status-row">
+            <div class="hint" id="chatStatus" style="margin:0"></div>
+            <button class="ghost mini" id="chatLoadHistory" onclick="loadChatHistory()" disabled>加载历史聊天</button>
+          </div>
         </div>
       </div>
     </div>
@@ -877,6 +882,9 @@ const I18N_EN = {
   "默认": "Default",
   "点击真实账号加载": "Select a real account to load",
   "点击左侧具体账号加载聊天记录": "Select a specific account on the left to load chat history",
+  "加载历史聊天": "Load chat history",
+  "已选择账号，点击「加载历史聊天」可载入记录": "Account selected; click \"Load chat history\" to load records",
+  "已选择账号，尚未加载历史聊天": "Account selected; history not loaded yet",
   "请先在左侧选择具体账号": "Select a specific account on the left first",
   "重载": "Reload",
   "发送": "Send",
@@ -2551,7 +2559,25 @@ function resetChatToDefault(){
   box.appendChild(chatBubble('system', '点击左侧具体账号加载聊天记录'));
   $('chatInput').disabled = true;
   $('chatSend').disabled = true;
+  $('chatLoadHistory').disabled = true;
   $('chatStatus').textContent = '';
+}
+
+function prepareChatForAccount(){
+  chatFiles = [];
+  renderChatAttachments();
+  const box = $('chatMessages');
+  box.innerHTML = '';
+  box.appendChild(chatBubble('system', '已选择账号，点击「加载历史聊天」可载入记录'));
+  $('chatInput').disabled = false;
+  $('chatSend').disabled = false;
+  $('chatLoadHistory').disabled = false;
+  $('chatStatus').textContent = '已选择账号，尚未加载历史聊天';
+}
+
+function loadChatHistory(){
+  if (chatAccountId === 'default') { toast('请先在左侧选择具体账号', 'warn'); return; }
+  openChat();
 }
 
 function selectChatAccount(id){
@@ -2561,7 +2587,7 @@ function selectChatAccount(id){
     el.classList.toggle('active', el.dataset.id === id);
   });
   if (id === 'default') resetChatToDefault();
-  else openChat();
+  else prepareChatForAccount();
 }
 
 async function fillChatAccounts(){
@@ -2706,6 +2732,7 @@ async function openChat(){
   renderChatAttachments();
   $('chatInput').disabled = true;
   $('chatSend').disabled = true;
+  $('chatLoadHistory').disabled = true;
   $('chatStatus').textContent = '正在读取主聊记录…';
   try {
     const d = await api('/admin/chat/open', {
@@ -2722,10 +2749,12 @@ async function openChat(){
       + (emptyHistory ? '（主聊暂无历史，已打开新对话）' : '（已加载最近消息）');
     $('chatInput').disabled = false;
     $('chatSend').disabled = false;
+    $('chatLoadHistory').disabled = false;
     $('chatInput').focus();
   } catch (e) {
     renderChatHistory([]);
     $('chatStatus').textContent = '';
+    $('chatLoadHistory').disabled = false;
     toast('读取主聊失败：' + e.message, 'bad');
   } finally {
     setChatLoading(false);
