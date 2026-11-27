@@ -229,8 +229,10 @@
   .chat-account-item.active .ca-quota{color:var(--text)}
   @media(max-width:820px){.chat-layout{flex-direction:column}.chat-accounts{position:static;width:100%;flex:none;max-height:none;
     display:flex;flex-wrap:wrap;gap:6px}.chat-accounts h4{width:100%}.chat-account-item{width:auto;min-width:140px;margin:0}}
-  .chat-log{height:min(58vh,620px);min-height:320px;overflow-y:auto;border:1px solid var(--line);border-radius:var(--radius);
+  .chat-log{position:relative;height:min(58vh,620px);min-height:320px;overflow-y:auto;border:1px solid var(--line);border-radius:var(--radius);
     background:var(--bg2);padding:16px;display:flex;flex-direction:column;gap:12px}
+  .chat-history-btn{position:sticky;top:0;align-self:center;z-index:4;margin:-16px 0 0;
+    background:var(--panel);box-shadow:0 3px 12px rgba(0,0,0,.35)}
   .chat-msg{max-width:min(78%,760px);padding:10px 13px;border-radius:13px;white-space:pre-wrap;word-break:break-word;
     font-size:13.5px;line-height:1.65}
   .chat-msg.user{align-self:flex-end;background:linear-gradient(135deg,var(--accent2),var(--accent));color:#fff;border-bottom-right-radius:4px}
@@ -427,7 +429,10 @@
         <h3>网页聊天 <span class="tag">主聊 · 不使用 /thread/new</span></h3>
         <div class="hint">点击左侧具体账号仅选中，点击「加载历史聊天」后才载入该账号主聊记录；「默认」不会加载任何内容。可直接粘贴图片或视频（最多 10 个，单个 40 MiB）。</div>
         <div class="chat-shell">
-          <div class="chat-log" id="chatMessages"><div class="chat-msg system">点击左侧具体账号加载聊天记录</div></div>
+          <div class="chat-log" id="chatMessages">
+            <button class="ghost mini chat-history-btn" id="chatLoadHistory" onclick="loadChatHistory()" disabled>加载历史聊天</button>
+            <div class="chat-msg system">点击左侧具体账号加载聊天记录</div>
+          </div>
           <div class="chat-attachments" id="chatAttachments"></div>
           <div class="chat-composer">
             <textarea id="chatInput" rows="3" placeholder="输入消息，或 Ctrl+V 粘贴图片/视频；Enter 发送，Shift+Enter 换行" disabled></textarea>
@@ -435,7 +440,6 @@
           </div>
           <div class="chat-status-row">
             <div class="hint" id="chatStatus" style="margin:0"></div>
-            <button class="ghost mini" id="chatLoadHistory" onclick="loadChatHistory()" disabled>加载历史聊天</button>
           </div>
         </div>
       </div>
@@ -2551,11 +2555,16 @@ function setChatLoading(on){
   });
 }
 
+function clearChatMessages(){
+  const box = $('chatMessages');
+  [...box.children].forEach(el => { if (el.id !== 'chatLoadHistory') el.remove(); });
+}
+
 function resetChatToDefault(){
   chatFiles = [];
   renderChatAttachments();
   const box = $('chatMessages');
-  box.innerHTML = '';
+  clearChatMessages();
   box.appendChild(chatBubble('system', '点击左侧具体账号加载聊天记录'));
   $('chatInput').disabled = true;
   $('chatSend').disabled = true;
@@ -2567,7 +2576,7 @@ function prepareChatForAccount(){
   chatFiles = [];
   renderChatAttachments();
   const box = $('chatMessages');
-  box.innerHTML = '';
+  clearChatMessages();
   box.appendChild(chatBubble('system', '已选择账号，点击「加载历史聊天」可载入记录'));
   $('chatInput').disabled = false;
   $('chatSend').disabled = false;
@@ -2652,7 +2661,7 @@ function appendChatMedia(el, media){
 
 function renderChatHistory(messages){
   const box = $('chatMessages');
-  box.innerHTML = '';
+  clearChatMessages();
   const list = Array.isArray(messages) ? messages : [];
   if (!list.length) box.appendChild(chatBubble('system', '该账号主聊暂无最近消息，可以直接开始对话'));
   list.forEach(m => {
