@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import glob
 import copy
 import hashlib
 import http.client
@@ -1936,14 +1937,41 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             return False
 
-    def _save_media_bytes(self, data: bytes, mime: str, url: str, kind: str) -> dict | None:
+    @staticmethod
+    def _history_media_hint(account_id: str | None, text_hash: str,
+                            ordinal: int, kind: str) -> str:
+        """文件名即索引：由账号+消息文字+媒体序号派生，视频落盘为 <hint>.mp4。"""
+        raw = f"{account_id or ''}|{text_hash}|{ordinal}|{kind}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    def _cached_history_media(self, hint: str, kind: str) -> dict | None:
+        """按 hint 找已落盘媒体；超过 7 天自动删除并视为未命中。"""
+        now = time.time()
+        for path in glob.glob(os.path.join(self.cfg.media_dir, hint + ".*")):
+            try:
+                age = now - os.path.getmtime(path)
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            if age >= 7 * 86400:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                continue
+            name = os.path.basename(path)
+            return {"kind": kind, "filename": name, "url": "/v1/media/" + name,
+                    "bytes": size, "mime": mimetypes.guess_type(name)[0] or ""}
+        return None
+
+    def _save_media_bytes(self, data: bytes, mime: str, url: str, kind: str,
+                          name_hint: str | None = None) -> dict | None:
         if not data or len(data) > MAX_HISTORY_MEDIA_BYTES:
             return None
         ext = self._pick_ext(mime, url, kind)
         if kind == "video" and ext not in (".mp4", ".webm", ".mov", ".m4v"):
             return None
-        digest = hashlib.sha256(data).hexdigest()
-        name = digest[:24] + ext
+        name = (name_hint + ext) if name_hint else (hashlib.sha256(data).hexdigest()[:24] + ext)
         os.makedirs(self.cfg.media_dir, exist_ok=True)
         dst = os.path.join(self.cfg.media_dir, name)
         if not os.path.exists(dst):
@@ -1952,17 +1980,19 @@ class MuseEngine:
         return {"kind": kind, "filename": name, "url": "/v1/media/" + name,
                 "bytes": len(data), "mime": mime}
 
-    def _persist_history_media(self, src: str, kind: str) -> dict | None:
+    def _persist_history_media(self, src: str, kind: str,
+                               name_hint: str | None = None) -> dict | None:
         """把历史里的 blob 媒体落到 media 目录，返回短 URL，避免大 base64 走 JSON。"""
         try:
             data, mime, url = self.extract_bytes(src, expect=kind, retries=1, timeout=25)
         except Exception as exc:  # noqa: BLE001
             log.warning("历史媒体取回失败: %s", type(exc).__name__)
             return None
-        return self._save_media_bytes(data, mime, url, kind)
+        return self._save_media_bytes(data, mime, url, kind, name_hint=name_hint)
 
-    def main_chat_history(self, limit: int = 20, with_media: bool = False) -> list[dict]:
-        """读取主聊页面最近若干条消息；with_media 时把气泡里的 blob 媒体转成 data URL。"""
+    def main_chat_history(self, limit: int = 20, with_media: bool = False,
+                          account_id: str | None = None) -> list[dict]:
+        """读取主聊页面最近若干条消息；with_media 时取回媒体并落盘，命中缓存则不重复下载。"""
         page = self.page
         if not page:
             return []
@@ -1998,14 +2028,19 @@ class MuseEngine:
         # 从最新消息往前取，避免名额被更早的历史图片占满。
         for index in range(len(items) - 1, -1, -1):
             msg = items[index]
-            for med in reversed(msg.get("media") or []):
+            text_hash = hashlib.sha256(
+                str(msg.get("text") or "").encode("utf-8")).hexdigest()
+            media_list = msg.get("media") or []
+            for ordinal in range(len(media_list) - 1, -1, -1):
                 if len(wanted) >= MAX_HISTORY_MEDIA_ITEMS:
                     break
+                med = media_list[ordinal]
                 if not isinstance(med, dict) or not med.get("src"):
                     continue
                 wanted.append({"i": index, "kind": med.get("kind", "image"),
                                "src": med["src"], "w": med.get("w", 0),
-                               "h": med.get("h", 0)})
+                               "h": med.get("h", 0),
+                               "text_hash": text_hash, "ordinal": ordinal})
             if len(wanted) >= MAX_HISTORY_MEDIA_ITEMS:
                 break
         if not wanted:
@@ -2013,8 +2048,18 @@ class MuseEngine:
                      time.monotonic() - t0, len(items))
             return items
         loaded = []
+        hits = 0
         for w in wanted:
-            saved = self._persist_history_media(w["src"], w["kind"])
+            hint = self._history_media_hint(
+                account_id, w["text_hash"], w["ordinal"], w["kind"])
+            cached = self._cached_history_media(hint, w["kind"])
+            if cached:
+                entry = {"i": w["i"], "kind": w["kind"], "src": w["src"]}
+                entry.update(cached)
+                loaded.append(entry)
+                hits += 1
+                continue
+            saved = self._persist_history_media(w["src"], w["kind"], name_hint=hint)
             if not saved and w["src"].startswith(("http://", "https://")):
                 # 页面里 fetch 被 CORS 拦住时，服务端按账号代理下载后落盘。
                 try:
@@ -2025,13 +2070,15 @@ class MuseEngine:
                     if response.ok:
                         mime = (response.headers.get("Content-Type") or "image/png").split(";", 1)[0].strip()
                         saved = self._save_media_bytes(response.content, mime,
-                                                       w["src"], w["kind"])
+                                                       w["src"], w["kind"],
+                                                       name_hint=hint)
                 except Exception:  # noqa: BLE001
                     pass
             if saved:
                 entry = {"i": w["i"], "kind": w["kind"], "src": w["src"]}
                 entry.update(saved)
                 loaded.append(entry)
+        log.info("主聊历史媒体缓存命中 %s/%s（按文字哈希文件名）", hits, len(wanted))
         if len(loaded) != len(wanted):
             log.warning("主聊历史媒体回显 %s/%s（已落盘为 /v1/media 链接）",
                         len(loaded), len(wanted))

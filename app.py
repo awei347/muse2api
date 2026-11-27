@@ -628,7 +628,8 @@ def admin_chat_stream(account_id: str | None, message: str, timeout: int, limit:
                 q.put(("delta", chunk))
             engine.wait_new_chat_attachment(timeout=3.0)
             path = _admin_chat_page_path()
-            messages = engine.main_chat_history(limit, with_media=True)
+            messages = engine.main_chat_history(limit, with_media=True,
+                                                account_id=leased["id"])
             store.mark(leased["id"], True, "")
             _sync_cookies(leased["id"])
             q.put(("done", {"account": _admin_chat_account_view(leased),
@@ -2262,7 +2263,8 @@ async def admin_chat_open(req: AdminChatOpenReq, _=Depends(auth)):
             engine.open_main_chat(source["cookies"], source.get("cookies_exp"),
                                   account_id=leased["id"])
             return {"account": _admin_chat_account_view(leased),
-                    "messages": engine.main_chat_history(req.limit, with_media=True),
+                    "messages": engine.main_chat_history(req.limit, with_media=True,
+                                                         account_id=leased["id"]),
                     "path": _admin_chat_page_path()}
         except HTTPException:
             raise
