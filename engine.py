@@ -1936,6 +1936,31 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             return False
 
+    def _save_media_bytes(self, data: bytes, mime: str, url: str, kind: str) -> dict | None:
+        if not data or len(data) > MAX_HISTORY_MEDIA_BYTES:
+            return None
+        ext = self._pick_ext(mime, url, kind)
+        if kind == "video" and ext not in (".mp4", ".webm", ".mov", ".m4v"):
+            return None
+        digest = hashlib.sha256(data).hexdigest()
+        name = digest[:24] + ext
+        os.makedirs(self.cfg.media_dir, exist_ok=True)
+        dst = os.path.join(self.cfg.media_dir, name)
+        if not os.path.exists(dst):
+            with open(dst, "wb") as f:
+                f.write(data)
+        return {"kind": kind, "filename": name, "url": "/v1/media/" + name,
+                "bytes": len(data), "mime": mime}
+
+    def _persist_history_media(self, src: str, kind: str) -> dict | None:
+        """把历史里的 blob 媒体落到 media 目录，返回短 URL，避免大 base64 走 JSON。"""
+        try:
+            data, mime, url = self.extract_bytes(src, expect=kind, retries=1, timeout=25)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("历史媒体取回失败: %s", type(exc).__name__)
+            return None
+        return self._save_media_bytes(data, mime, url, kind)
+
     def main_chat_history(self, limit: int = 20, with_media: bool = False) -> list[dict]:
         """读取主聊页面最近若干条消息；with_media 时把气泡里的 blob 媒体转成 data URL。"""
         page = self.page
@@ -1987,40 +2012,29 @@ class MuseEngine:
             log.info("主聊历史读取耗时 %.1fs（无媒体，%s 条）",
                      time.monotonic() - t0, len(items))
             return items
-        try:
-            raw = page.js(self._HISTORY_MEDIA_JS % (
-                json.dumps(wanted), MAX_HISTORY_MEDIA_BYTES),
-                await_promise=True, timeout=20)
-            loaded = raw if isinstance(raw, list) else (json.loads(raw) if raw else [])
-        except Exception as exc:  # noqa: BLE001
-            log.warning("读取主聊历史媒体失败: %s", type(exc).__name__)
-            loaded = []
-        # 跨域 http(s) 图片在页面里 fetch 会被 CORS 拦住，改由服务端按账号代理取回。
-        src_by_key = {(w["i"], w["src"]): w["src"] for w in wanted}
-        for entry in loaded:
-            if not isinstance(entry, dict) or entry.get("dataUrl"):
-                continue
-            src = src_by_key.get((entry.get("i"), entry.get("src")), "")
-            if not src.startswith(("http://", "https://")):
-                continue
-            try:
-                import requests
-                proxy = getattr(self._ensure_local(), "proxy_snapshot", None)
-                with request_proxy_context(proxy) as proxy_options:
-                    response = requests.get(src, timeout=20, **proxy_options)
-                if response.ok and 0 < len(response.content) <= MAX_HISTORY_MEDIA_BYTES:
-                    mime = (response.headers.get("Content-Type") or "image/png").split(";", 1)[0].strip()
-                    entry["dataUrl"] = ("data:%s;base64,%s"
-                                        % (mime, base64.b64encode(response.content).decode("ascii")))
-                    entry.pop("error", None)
-                    entry.pop("tooLarge", None)
-            except Exception:  # noqa: BLE001
-                pass
-        ok_count = sum(1 for e in loaded if isinstance(e, dict) and e.get("dataUrl"))
-        if ok_count != len(wanted):
-            log.warning("主聊历史媒体回显 %s/%s，失败项: %s", ok_count, len(wanted),
-                        [e.get("error") or ("tooLarge" if e.get("tooLarge") else "no-data")
-                         for e in loaded if isinstance(e, dict) and not e.get("dataUrl")])
+        loaded = []
+        for w in wanted:
+            saved = self._persist_history_media(w["src"], w["kind"])
+            if not saved and w["src"].startswith(("http://", "https://")):
+                # 页面里 fetch 被 CORS 拦住时，服务端按账号代理下载后落盘。
+                try:
+                    import requests
+                    proxy = getattr(self._ensure_local(), "proxy_snapshot", None)
+                    with request_proxy_context(proxy) as proxy_options:
+                        response = requests.get(w["src"], timeout=20, **proxy_options)
+                    if response.ok:
+                        mime = (response.headers.get("Content-Type") or "image/png").split(";", 1)[0].strip()
+                        saved = self._save_media_bytes(response.content, mime,
+                                                       w["src"], w["kind"])
+                except Exception:  # noqa: BLE001
+                    pass
+            if saved:
+                entry = {"i": w["i"], "kind": w["kind"], "src": w["src"]}
+                entry.update(saved)
+                loaded.append(entry)
+        if len(loaded) != len(wanted):
+            log.warning("主聊历史媒体回显 %s/%s（已落盘为 /v1/media 链接）",
+                        len(loaded), len(wanted))
         resolved: dict[tuple[int, str], dict] = {}
         for entry in loaded:
             if not isinstance(entry, dict) or entry.get("i") is None:
@@ -2147,11 +2161,12 @@ class MuseEngine:
             out += chunk
         return out
 
-    def extract_bytes(self, src: str, expect: str = "image", retries: int = 4):
+    def extract_bytes(self, src: str, expect: str = "image", retries: int = 4,
+                      timeout: int = 600):
         last = "未知"
         for _ in range(retries):
             raw = self.page.js(self._EXTRACT_JS % (json.dumps(src), json.dumps(expect)),
-                               await_promise=True, timeout=600)
+                               await_promise=True, timeout=timeout)
             try:
                 info = json.loads(raw) if isinstance(raw, str) else raw
             except Exception:  # noqa: BLE001

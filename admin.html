@@ -2640,12 +2640,12 @@ function chatBubble(role, text){
 function appendChatMedia(el, media){
   const seen = new Set();
   (Array.isArray(media) ? media : []).forEach(m => {
-    const key = m ? (m.dataUrl || m.src || '') : '';
+    const key = m ? (m.dataUrl || m.url || m.src || '') : '';
     if (key && seen.has(key)) return;
     if (key) seen.add(key);
-    if (m && m.dataUrl) {
+    if (m && (m.dataUrl || m.url)) {
       const node = document.createElement(m.kind === 'video' ? 'video' : 'img');
-      node.src = m.dataUrl;
+      node.src = m.dataUrl || m.url;
       if (m.kind === 'video') { node.controls = true; node.preload = 'metadata'; }
       else node.alt = 'muse 图片';
       el.appendChild(node);
